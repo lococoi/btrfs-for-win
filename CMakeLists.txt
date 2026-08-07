@@ -30,6 +30,7 @@ set(ZSTD_SRC_FILES src/zstd/lib/common/entropy_common.c
     src/zstd/lib/compress/zstd_compress_literals.c
     src/zstd/lib/compress/zstd_compress_sequences.c
     src/zstd/lib/compress/zstd_compress_superblock.c
+    src/zstd/lib/compress/zstd_preSplit.c
     src/zstd/lib/decompress/zstd_ddict.c
     src/zstd/lib/decompress/zstd_decompress.c
     src/zstd/lib/decompress/zstd_decompress_block.c

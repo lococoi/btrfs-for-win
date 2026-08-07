@@ -20,8 +20,8 @@
 #undef _WIN32_WINNT
 #undef NTDDI_VERSION
 
-#define _WIN32_WINNT 0x0601
-#define NTDDI_VERSION 0x06020000 // Win 8
+#define _WIN32_WINNT 0x0A00
+#define NTDDI_VERSION 0x0A000006 // Win 10 RS5
 #define _CRT_SECURE_NO_WARNINGS
 #define _NO_CRT_STDIO_INLINE
 
@@ -148,6 +148,7 @@ typedef struct _FILE_ID_128 {
 #define FILE_CS_FLAG_CASE_SENSITIVE_DIR                 1
 #endif
 
+#ifndef _MSC_VER
 typedef struct _DUPLICATE_EXTENTS_DATA {
     HANDLE FileHandle;
     LARGE_INTEGER SourceFileOffset;
@@ -173,6 +174,7 @@ typedef struct _FSCTL_SET_INTEGRITY_INFORMATION_BUFFER {
 
 #define FSCTL_GET_INTEGRITY_INFORMATION CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 159, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define FSCTL_SET_INTEGRITY_INFORMATION CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 160, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#endif
 
 #ifndef _MSC_VER
 #define __drv_aliasesMem
@@ -415,11 +417,21 @@ typedef struct _tree {
     bool is_unique;
     bool uniqueness_determined;
     uint8_t* buf;
+
+    // Binary search index cache: sorted array of pointers to tree_data items.
+    // Built at load time from the sorted linked list; invalidated on mutation.
+    tree_data** search_index;
+    uint32_t search_index_count;
 } tree;
 
 typedef struct {
     ERESOURCE load_tree_lock;
 } root_nonpaged;
+
+// Lock level for per-subvolume locks. Hierarchy: tree_lock -> subvol_lock.
+// subvol_lock protects subvolume-specific state (fcbs list, subvol flags, etc.)
+// and is acquired AFTER tree_lock when both are needed.
+_Create_lock_level_(subvol_lock)
 
 typedef struct _root {
     uint64_t id;
@@ -435,6 +447,19 @@ typedef struct _root {
     uint64_t fcbs_version;
     bool checked_for_orphans;
     bool dropped;
+    // Per-subvolume lock. Protects subvolume-specific state (fcbs list,
+    // subvol dirty flag, subvol metadata). Hierarchy: tree_lock -> subvol_lock.
+    //
+    // DESIGN NOTE (Phase 3.1 - Granular tree_lock analysis):
+    // This lock is NOT used in the flush path because flush_fcb() modifies
+    // global state (checksum tree via add_checksum_entry(), extent tree via
+    // rationalize_extents()), commit_batch_list() modifies the global tree
+    // cache, and update_chunks()/write_trees() are cross-subvolume ops.
+    //
+    // USE CASE: Intended for I/O path operations that only access a single
+    // subvolume's data (e.g., read_csum(), single-file reads), where it can
+    // replace tree_lock shared to allow true parallelism across subvolumes.
+    _Has_lock_level_(subvol_lock) ERESOURCE subvol_lock;
     LIST_ENTRY fcbs;
     LIST_ENTRY* fcbs_ptrs[256];
     LIST_ENTRY list_entry;
@@ -565,7 +590,33 @@ typedef struct {
 
     LIST_ENTRY list_entry;
     LIST_ENTRY list_entry_balance;
+    LIST_ENTRY list_entry_hash;
 } chunk;
+
+typedef struct {
+    uint64_t off;
+    uint64_t ed_size;
+    uint64_t ed_offset;
+    uint64_t ed_num_bytes;
+} read_part_extent;
+
+typedef struct {
+    LIST_ENTRY list_entry;
+    uint64_t addr;
+    chunk* c;
+    uint32_t read;
+    uint32_t to_read;
+    void* csum;
+    bool csum_free;
+    uint8_t* buf;
+    bool buf_free;
+    uint32_t bumpoff;
+    bool mdl;
+    void* data;
+    uint8_t compression;
+    unsigned int num_extents;
+    read_part_extent extents[1];
+} read_part;
 
 typedef struct {
     uint64_t address;
@@ -621,6 +672,15 @@ typedef struct {
     enum calc_thread_type type;
     NTSTATUS Status;
 } calc_job;
+
+typedef struct {
+    LIST_ENTRY list_entry;
+    calc_job* cj;
+    void* decomp;
+    void* data;
+    unsigned int offset;
+    size_t length;
+} comp_calc_job;
 
 typedef struct {
     PDEVICE_OBJECT DeviceObject;
@@ -781,6 +841,10 @@ typedef struct _device_extension {
     bool chunk_usage_found;
     LIST_ENTRY sys_chunks;
     LIST_ENTRY chunks;
+
+#define CHUNK_HASH_TABLE_SIZE 256
+    LIST_ENTRY chunks_hash_table[CHUNK_HASH_TABLE_SIZE];
+
     LIST_ENTRY trees;
     LIST_ENTRY trees_hash;
     LIST_ENTRY* trees_ptrs[256];
@@ -811,8 +875,24 @@ typedef struct _device_extension {
     PAGED_LOOKASIDE_LIST name_bit_lookaside;
     NPAGED_LOOKASIDE_LIST range_lock_lookaside;
     NPAGED_LOOKASIDE_LIST fcb_np_lookaside;
+    NPAGED_LOOKASIDE_LIST read_part_lookaside;
+    NPAGED_LOOKASIDE_LIST comp_calc_job_lookaside;
+    NPAGED_LOOKASIDE_LIST write_data_stripe_lookaside;
     LIST_ENTRY list_entry;
 } device_extension;
+
+static inline uint32_t get_chunk_hash(uint64_t offset) {
+    return (uint32_t)((offset >> 16) % CHUNK_HASH_TABLE_SIZE);
+}
+
+static inline void chunk_hash_insert(device_extension* Vcb, chunk* c) {
+    uint32_t h = get_chunk_hash(c->offset);
+    InsertTailList(&Vcb->chunks_hash_table[h], &c->list_entry_hash);
+}
+
+static inline void chunk_hash_remove(chunk* c) {
+    RemoveEntryList(&c->list_entry_hash);
+}
 
 typedef struct {
     uint32_t type;
@@ -915,6 +995,7 @@ typedef struct _write_data_context {
     bool need_wait;
     uint8_t *parity1, *parity2, *scratch;
     PMDL mdl, parity1_mdl, parity2_mdl;
+    device_extension* Vcb;
 } write_data_context;
 
 typedef struct {
@@ -989,12 +1070,12 @@ static __inline uint64_t make_file_id(root* r, uint64_t inode) {
 }
 
 #define keycmp(key1, key2)\
-    ((key1.obj_id < key2.obj_id) ? -1 :\
-    ((key1.obj_id > key2.obj_id) ? 1 :\
-    ((key1.obj_type < key2.obj_type) ? -1 :\
-    ((key1.obj_type > key2.obj_type) ? 1 :\
-    ((key1.offset < key2.offset) ? -1 :\
-    ((key1.offset > key2.offset) ? 1 :\
+    (((key1).obj_id < (key2).obj_id) ? -1 :\
+    (((key1).obj_id > (key2).obj_id) ? 1 :\
+    (((key1).obj_type < (key2).obj_type) ? -1 :\
+    (((key1).obj_type > (key2).obj_type) ? 1 :\
+    (((key1).offset < (key2).offset) ? -1 :\
+    (((key1).offset > (key2).offset) ? 1 :\
     0))))))
 
 _Post_satisfies_(return>=n)

@@ -1320,6 +1320,7 @@ NTSTATUS create_root(_In_ _Requires_exclusive_lock_held_(_Curr_->tree_lock) devi
     }
 
     ExInitializeResourceLite(&r->nonpaged->load_tree_lock);
+    ExInitializeResourceLite(&r->subvol_lock);
 
     InsertTailList(&Vcb->roots, &r->list_entry);
 
@@ -1744,6 +1745,7 @@ void reap_fcb(fcb* fcb) {
         RemoveEntryList(&fcb->list_entry);
 
         if (fcb->subvol && fcb->subvol->dropped && IsListEmpty(&fcb->subvol->fcbs)) {
+            ExDeleteResourceLite(&fcb->subvol->subvol_lock);
             ExDeleteResourceLite(&fcb->subvol->nonpaged->load_tree_lock);
             ExFreePool(fcb->subvol->nonpaged);
             ExFreePool(fcb->subvol);
@@ -2115,6 +2117,7 @@ void uninit(_In_ device_extension* Vcb) {
     while (!IsListEmpty(&Vcb->roots)) {
         root* r = CONTAINING_RECORD(RemoveHeadList(&Vcb->roots), root, list_entry);
 
+        ExDeleteResourceLite(&r->subvol_lock);
         ExDeleteResourceLite(&r->nonpaged->load_tree_lock);
         ExFreePool(r->nonpaged);
         ExFreePool(r);
@@ -2192,6 +2195,9 @@ void uninit(_In_ device_extension* Vcb) {
     ExDeletePagedLookasideList(&Vcb->name_bit_lookaside);
     ExDeleteNPagedLookasideList(&Vcb->range_lock_lookaside);
     ExDeleteNPagedLookasideList(&Vcb->fcb_np_lookaside);
+    ExDeleteNPagedLookasideList(&Vcb->read_part_lookaside);
+    ExDeleteNPagedLookasideList(&Vcb->comp_calc_job_lookaside);
+    ExDeleteNPagedLookasideList(&Vcb->write_data_stripe_lookaside);
 
     ZwClose(Vcb->flush_thread_handle);
 
@@ -3011,6 +3017,7 @@ static NTSTATUS add_root(_Inout_ device_extension* Vcb, _In_ uint64_t id, _In_ u
     }
 
     ExInitializeResourceLite(&r->nonpaged->load_tree_lock);
+    ExInitializeResourceLite(&r->subvol_lock);
 
     r->lastinode = 0;
 
@@ -3737,6 +3744,8 @@ static NTSTATUS load_chunk_root(_In_ _Requires_lock_held_(_Curr_->tree_lock) dev
                 c->last_stripe = 0;
 
                 InsertTailList(&Vcb->chunks, &c->list_entry);
+
+                chunk_hash_insert(Vcb, c);
 
                 c->list_entry_balance.Flink = NULL;
             }
@@ -4722,6 +4731,8 @@ static NTSTATUS mount_vol(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp) {
     }
 
     InitializeListHead(&Vcb->chunks);
+    for (uint32_t i = 0; i < CHUNK_HASH_TABLE_SIZE; i++)
+        InitializeListHead(&Vcb->chunks_hash_table[i]);
     InitializeListHead(&Vcb->trees);
     InitializeListHead(&Vcb->trees_hash);
     InitializeListHead(&Vcb->all_fcbs);
@@ -4745,6 +4756,9 @@ static NTSTATUS mount_vol(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp) {
     ExInitializePagedLookasideList(&Vcb->name_bit_lookaside, NULL, NULL, 0, sizeof(name_bit), ALLOC_TAG, 0);
     ExInitializeNPagedLookasideList(&Vcb->range_lock_lookaside, NULL, NULL, 0, sizeof(range_lock), ALLOC_TAG, 0);
     ExInitializeNPagedLookasideList(&Vcb->fcb_np_lookaside, NULL, NULL, 0, sizeof(fcb_nonpaged), ALLOC_TAG, 0);
+    ExInitializeNPagedLookasideList(&Vcb->read_part_lookaside, NULL, NULL, 0, sizeof(read_part), ALLOC_TAG, 0);
+    ExInitializeNPagedLookasideList(&Vcb->comp_calc_job_lookaside, NULL, NULL, 0, sizeof(comp_calc_job), ALLOC_TAG, 0);
+    ExInitializeNPagedLookasideList(&Vcb->write_data_stripe_lookaside, NULL, NULL, 0, sizeof(write_data_stripe), ALLOC_TAG, 0);
     init_lookaside = true;
 
     Vcb->Vpb = IrpSp->Parameters.MountVolume.Vpb;
@@ -5058,6 +5072,9 @@ exit:
                 ExDeletePagedLookasideList(&Vcb->name_bit_lookaside);
                 ExDeleteNPagedLookasideList(&Vcb->range_lock_lookaside);
                 ExDeleteNPagedLookasideList(&Vcb->fcb_np_lookaside);
+                ExDeleteNPagedLookasideList(&Vcb->read_part_lookaside);
+                ExDeleteNPagedLookasideList(&Vcb->comp_calc_job_lookaside);
+                ExDeleteNPagedLookasideList(&Vcb->write_data_stripe_lookaside);
             }
 
             if (Vcb->root_file)

@@ -18,6 +18,75 @@
 #include "btrfs_drv.h"
 #include "crc32c.h"
 
+// --- Binary search index helpers for B-tree nodes ---
+
+// Invalidate (free) the binary search index for a tree node.
+// After this, searches fall back to linear traversal of itemlist.
+static __inline void invalidate_search_index(tree* t) {
+    if (t->search_index) {
+        ExFreePool(t->search_index);
+        t->search_index = NULL;
+    }
+    t->search_index_count = 0;
+}
+
+// Build a sorted binary search index from the itemlist linked list.
+// This should be called right after load_tree() populates the itemlist,
+// when items are guaranteed to be in sorted order from disk.
+static void build_search_index(tree* t) {
+    tree_data** idx;
+    uint32_t count = 0;
+    uint32_t i, j;
+    LIST_ENTRY* le;
+
+    // Count items first
+    le = t->itemlist.Flink;
+    while (le != &t->itemlist) {
+        count++;
+        le = le->Flink;
+    }
+
+    if (count == 0) {
+        t->search_index = NULL;
+        t->search_index_count = 0;
+        return;
+    }
+
+    idx = (tree_data**)ExAllocatePoolWithTag(PagedPool, count * sizeof(tree_data*), ALLOC_TAG);
+    if (!idx) {
+        // Allocation failed - leave index NULL, fall back to linear search
+        t->search_index = NULL;
+        t->search_index_count = 0;
+        return;
+    }
+
+    // Fill the array
+    count = 0;
+    le = t->itemlist.Flink;
+    while (le != &t->itemlist) {
+        tree_data* td = CONTAINING_RECORD(le, tree_data, list_entry);
+        idx[count++] = td;
+        le = le->Flink;
+    }
+
+    // Items from disk are already sorted by key, but use insertion sort
+    // to guarantee correctness (k is small, typically <400 per node).
+    for (i = 1; i < count; i++) {
+        tree_data* key = idx[i];
+        j = i;
+        while (j > 0 && keycmp(idx[j - 1]->key, key->key) > 0) {
+            idx[j] = idx[j - 1];
+            j--;
+        }
+        idx[j] = key;
+    }
+
+    t->search_index = idx;
+    t->search_index_count = count;
+}
+
+// --- End binary search index helpers ---
+
 __attribute__((nonnull(1,3,4,5)))
 NTSTATUS load_tree(device_extension* Vcb, uint64_t addr, uint8_t* buf, root* r, tree** pt) {
     tree_header* th;
@@ -60,6 +129,8 @@ NTSTATUS load_tree(device_extension* Vcb, uint64_t addr, uint8_t* buf, root* r, 
     t->updated_extents = false;
     t->write = false;
     t->uniqueness_determined = false;
+    t->search_index = NULL;
+    t->search_index_count = 0;
 
     InitializeListHead(&t->itemlist);
 
@@ -185,6 +256,9 @@ NTSTATUS load_tree(device_extension* Vcb, uint64_t addr, uint8_t* buf, root* r, 
 
     ExReleaseFastMutex(&Vcb->trees_list_mutex);
 
+    // Build binary search index from the sorted itemlist
+    build_search_index(t);
+
     TRACE("returning %p\n", t);
 
     *pt = t;
@@ -308,6 +382,8 @@ void free_tree(tree* t) {
 
         RemoveEntryList(&t->list_entry_hash);
     }
+
+    invalidate_search_index(t);
 
     if (t->buf)
         ExFreePool(t->buf);
@@ -450,12 +526,139 @@ NTSTATUS skip_to_difference(device_extension* Vcb, traverse_ptr* tp, traverse_pt
     }
 }
 
+static void prefetch_tree_sibling(device_extension* Vcb, tree* parent, tree_data* td, PIRP Irp);
+
 __attribute__((nonnull(1,2,3,4)))
 static NTSTATUS find_item_in_tree(device_extension* Vcb, tree* t, traverse_ptr* tp, const KEY* searchkey, bool ignore, uint8_t level, PIRP Irp) {
     int cmp;
     tree_data *td, *lasttd;
     KEY key2;
 
+    // --- Binary search path using the sorted index array ---
+    if (t->search_index && t->search_index_count > 0) {
+        uint32_t lo = 0;
+        uint32_t hi = t->search_index_count;
+        // Invariant: search_index[lo].key <= searchkey < search_index[hi].key
+        // We want to find the largest index where key <= searchkey (floor).
+
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            cmp = keycmp(t->search_index[mid]->key, *searchkey);
+
+            if (cmp <= 0) {
+                // search_index[mid]->key <= searchkey, so mid is a candidate
+                lo = mid + 1;
+            } else {
+                // search_index[mid]->key > searchkey
+                hi = mid;
+            }
+        }
+
+        // lo is now the count of items with key <= searchkey.
+        // The best candidate is search_index[lo - 1], or NULL if lo == 0.
+        if (lo == 0) {
+            // All keys are greater than searchkey; no item with key <= searchkey.
+            // Fall through to use first_item (td = NULL path below).
+            td = NULL;
+            lasttd = NULL;
+        } else {
+            td = t->search_index[lo - 1];
+            lasttd = (lo >= 2) ? t->search_index[lo - 2] : NULL;
+        }
+
+        cmp = td ? keycmp(*searchkey, td->key) : 1;
+
+        // Handle ignore flag for leaf nodes (same logic as linear path)
+        if (t->header.level == 0 && cmp == 0 && !ignore && td && td->ignore) {
+            tree_data* origtd = td;
+
+            while (td && td->ignore)
+                td = next_item(t, td);
+
+            if (td) {
+                cmp = keycmp(*searchkey, td->key);
+
+                if (cmp != 0) {
+                    td = origtd;
+                    cmp = 0;
+                }
+            } else
+                td = origtd;
+        }
+
+        if ((cmp == -1 || !td) && lasttd)
+            td = lasttd;
+
+        if (!td) {
+            // Shouldn't happen on a well-formed tree, but handle gracefully
+            return STATUS_NOT_FOUND;
+        }
+
+        if (t->header.level == 0) {
+            if (td->ignore && !ignore) {
+                traverse_ptr oldtp;
+
+                oldtp.tree = t;
+                oldtp.item = td;
+
+                while (find_prev_item(Vcb, &oldtp, tp, Irp)) {
+                    if (!tp->item->ignore)
+                        return STATUS_SUCCESS;
+
+                    oldtp = *tp;
+                }
+
+                oldtp.tree = t;
+                oldtp.item = td;
+
+                while (find_next_item(Vcb, &oldtp, tp, true, Irp)) {
+                    if (!tp->item->ignore)
+                        return STATUS_SUCCESS;
+
+                    oldtp = *tp;
+                }
+
+                return STATUS_NOT_FOUND;
+            } else {
+                tp->tree = t;
+                tp->item = td;
+            }
+
+            return STATUS_SUCCESS;
+        } else {
+            NTSTATUS Status;
+
+            while (td && td->treeholder.tree && IsListEmpty(&td->treeholder.tree->itemlist)) {
+                td = prev_item(t, td);
+            }
+
+            if (!td)
+                return STATUS_NOT_FOUND;
+
+            if (t->header.level <= level) {
+                tp->tree = t;
+                tp->item = td;
+                return STATUS_SUCCESS;
+            }
+
+            if (!td->treeholder.tree) {
+                Status = do_load_tree(Vcb, &td->treeholder, t->root, t, td, Irp);
+                if (!NT_SUCCESS(Status)) {
+                    ERR("do_load_tree returned %08lx\n", Status);
+                    return Status;
+                }
+
+                // Prefetch next sibling for sequential extent tree traversal
+                prefetch_tree_sibling(Vcb, t, td, Irp);
+            }
+
+            Status = find_item_in_tree(Vcb, td->treeholder.tree, tp, searchkey, ignore, level, Irp);
+
+            return Status;
+        }
+    }
+
+    // --- Fallback: linear search through linked list ---
     cmp = 1;
     td = first_item(t);
     lasttd = NULL;
@@ -548,6 +751,9 @@ static NTSTATUS find_item_in_tree(device_extension* Vcb, tree* t, traverse_ptr* 
                 ERR("do_load_tree returned %08lx\n", Status);
                 return Status;
             }
+
+            // Prefetch next sibling for sequential extent tree traversal
+            prefetch_tree_sibling(Vcb, t, td, Irp);
         }
 
         Status = find_item_in_tree(Vcb, td->treeholder.tree, tp, searchkey, ignore, level, Irp);
@@ -602,6 +808,43 @@ NTSTATUS find_item_to_level(device_extension* Vcb, root* r, traverse_ptr* tp, co
     return Status;
 }
 
+// --- B-tree sibling node prefetch ---
+// When a B-tree node is loaded, prefetch the next sibling from disk.
+// This warms the disk cache for sequential tree traversals (e.g. extent
+// tree scans during sequential file reads). The I/O is best-effort —
+// failures are silently ignored.
+
+static void prefetch_tree_sibling(device_extension* Vcb, tree* parent, tree_data* td, PIRP Irp) {
+    tree_data* next_sib;
+    uint8_t* buf;
+
+    if (!parent || !td)
+        return;
+
+    next_sib = next_item(parent, td);
+    if (!next_sib)
+        return;
+
+    // Only prefetch if the sibling is not already loaded in memory
+    if (next_sib->treeholder.tree)
+        return;
+
+    if (next_sib->treeholder.address == 0)
+        return;
+
+    buf = ExAllocatePoolWithTag(PagedPool, Vcb->superblock.node_size, ALLOC_TAG);
+    if (!buf)
+        return;
+
+    // Read the sibling node from disk. This warms the OS disk cache so that
+    // the subsequent do_load_tree() call (if needed) hits the cache.
+    read_data(Vcb, next_sib->treeholder.address, Vcb->superblock.node_size,
+              NULL, true, buf, NULL, NULL, Irp, next_sib->treeholder.generation,
+              false, LowPagePriority);
+
+    ExFreePool(buf);
+}
+
 __attribute__((nonnull(1,2,3)))
 bool find_next_item(_Requires_lock_held_(_Curr_->tree_lock) device_extension* Vcb, const traverse_ptr* tp, traverse_ptr* next_tp, bool ignore, PIRP Irp) {
     tree* t;
@@ -652,6 +895,9 @@ bool find_next_item(_Requires_lock_held_(_Curr_->tree_lock) device_extension* Vc
             ERR("do_load_tree returned %08lx\n", Status);
             return false;
         }
+
+        // Prefetch the next sibling at this level for sequential traversal
+        prefetch_tree_sibling(Vcb, t->parent, td, Irp);
     }
 
     t = td->treeholder.tree;
@@ -670,6 +916,9 @@ bool find_next_item(_Requires_lock_held_(_Curr_->tree_lock) device_extension* Vc
                 ERR("do_load_tree returned %08lx\n", Status);
                 return false;
             }
+
+            // Prefetch next sibling at this internal level
+            prefetch_tree_sibling(Vcb, t, fi, Irp);
         }
 
         t = fi->treeholder.tree;
@@ -978,6 +1227,8 @@ NTSTATUS insert_tree_item(_In_ _Requires_exclusive_lock_held_(_Curr_->tree_lock)
     else
         InsertHeadList(&tp.item->list_entry, &td->list_entry);
 
+    invalidate_search_index(tp.tree);
+
     tp.tree->header.num_items++;
     tp.tree->size += size + sizeof(leaf_node);
 
@@ -1023,6 +1274,8 @@ NTSTATUS delete_tree_item(_In_ _Requires_exclusive_lock_held_(_Curr_->tree_lock)
 #endif
 
     tp->item->ignore = true;
+
+    invalidate_search_index(tp->tree);
 
     if (!tp->tree->write) {
         tp->tree->write = true;
@@ -1600,6 +1853,7 @@ static NTSTATUS handle_batch_collision(device_extension* Vcb, batch_item* bi, tr
 
                                 InsertHeadList(td->list_entry.Blink, &td2->list_entry);
 
+                                invalidate_search_index(t);
                                 t->header.num_items++;
                                 t->size += newlen + sizeof(leaf_node);
                                 t->write = true;
@@ -1687,6 +1941,7 @@ static NTSTATUS handle_batch_collision(device_extension* Vcb, batch_item* bi, tr
 
                                 InsertHeadList(td->list_entry.Blink, &td2->list_entry);
 
+                                invalidate_search_index(t);
                                 t->header.num_items++;
                                 t->size += newlen + sizeof(leaf_node);
                                 t->write = true;
@@ -1781,6 +2036,7 @@ static NTSTATUS handle_batch_collision(device_extension* Vcb, batch_item* bi, tr
 
                                 InsertHeadList(td->list_entry.Blink, &td2->list_entry);
 
+                                invalidate_search_index(t);
                                 t->header.num_items++;
                                 t->size += newlen + sizeof(leaf_node);
                                 t->write = true;
@@ -1852,6 +2108,7 @@ static NTSTATUS handle_batch_collision(device_extension* Vcb, batch_item* bi, tr
 
                                 InsertHeadList(td->list_entry.Blink, &td2->list_entry);
 
+                                invalidate_search_index(t);
                                 t->header.num_items++;
                                 t->size += newlen + sizeof(leaf_node);
                                 t->write = true;
@@ -1894,6 +2151,7 @@ static NTSTATUS handle_batch_collision(device_extension* Vcb, batch_item* bi, tr
             newtd->data = bi->data;
             newtd->size = bi->datalen;
             InsertHeadList(td->list_entry.Blink, &newtd->list_entry);
+            invalidate_search_index(t);
         }
     } else {
         ERR("(%I64x,%x,%I64x) already exists\n", bi->key.obj_id, bi->key.obj_type, bi->key.offset);
@@ -1946,6 +2204,9 @@ static NTSTATUS commit_batch_list_root(_Requires_exclusive_lock_held_(_Curr_->tr
             ERR("find_item returned %08lx\n", Status);
             return Status;
         }
+
+        // Invalidate search index for the target node, as batch operations will modify it
+        invalidate_search_index(tp.tree);
 
         Status = find_tree_end(tp.tree, &tree_end, &no_end);
         if (!NT_SUCCESS(Status)) {
@@ -2179,6 +2440,7 @@ static NTSTATUS commit_batch_list_root(_Requires_exclusive_lock_held_(_Curr_->tr
                     tree_data* paritem;
 
                     InsertHeadList(&tp.tree->itemlist, &td->list_entry);
+                    invalidate_search_index(tp.tree);
 
                     paritem = tp.tree->paritem;
                     while (paritem) {
@@ -2192,8 +2454,10 @@ static NTSTATUS commit_batch_list_root(_Requires_exclusive_lock_held_(_Curr_->tr
                 }
             } else if (cmp == 0) { // item already exists
                 if (tp.item->ignore) {
-                    if (td)
+                    if (td) {
                         InsertHeadList(tp.item->list_entry.Blink, &td->list_entry);
+                        invalidate_search_index(tp.tree);
+                    }
                 } else {
                     Status = handle_batch_collision(Vcb, bi, tp.tree, tp.item, td, &items, &ignore);
                     if (!NT_SUCCESS(Status)) {
@@ -2210,6 +2474,7 @@ static NTSTATUS commit_batch_list_root(_Requires_exclusive_lock_held_(_Curr_->tr
                 }
             } else if (td) {
                 InsertHeadList(&tp.item->list_entry, &td->list_entry);
+                invalidate_search_index(tp.tree);
             }
 
             if (bi->operation == Batch_DeleteInodeRef && cmp != 0 && Vcb->superblock.incompat_flags & BTRFS_INCOMPAT_FLAGS_EXTENDED_IREF) {
@@ -2305,8 +2570,10 @@ static NTSTATUS commit_batch_list_root(_Requires_exclusive_lock_held_(_Curr_->tr
                     }
 
                     if (td) {
-                        if (!inserted)
+                        if (!inserted) {
                             InsertTailList(&tp.tree->itemlist, &td->list_entry);
+                            invalidate_search_index(tp.tree);
+                        }
 
                         if (!ignore) {
                             tp.tree->header.num_items++;

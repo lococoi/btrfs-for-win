@@ -1,0 +1,76 @@
+# ------------------------------------------------------------------
+# Build output (CMake / MSVC / NMake)
+# ------------------------------------------------------------------
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+CMakeUserPresets.json
+CTestTestfile.cmake
+install_manifest.txt
+Testing/
+compile_commands.json
+
+# ------------------------------------------------------------------
+# Compiled binaries / objects
+# ------------------------------------------------------------------
+*.obj
+*.o
+*.a
+*.lib
+*.so
+*.dll
+*.sys
+*.exe
+*.pdb
+*.ilk
+*.idb
+*.pch
+*.exp
+*.map
+*.res
+*.manifest
+*.dumpbin
+
+# ------------------------------------------------------------------
+# IDEs / editors / local config
+# ------------------------------------------------------------------
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.ncb
+*.opendb
+*.VC.db
+*.VC.VC.opendb
+.DS_Store
+
+# ------------------------------------------------------------------
+# Logs / temp / OS
+# ------------------------------------------------------------------
+*.log
+*.tmp
+*.temp
+*.swp
+*~
+Thumbs.db
+Desktop.ini
+
+# ------------------------------------------------------------------
+# Personal / scratch files (not part of the project)
+# ------------------------------------------------------------------
+E
+replace_driver*.ps1
+replace_log*.txt
+benchmark_run_log.txt
+run_benchmarks_post_reboot.ps1
+AGENT-HANDOFF.md
+OPTIMIZATION_ANALYSIS.md
+plans/
+
+# ------------------------------------------------------------------
+# Benchmark harness (scripts, downloaded tools, results, VM images)
+# ------------------------------------------------------------------
+benchmark/

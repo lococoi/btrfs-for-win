@@ -89,20 +89,46 @@ bool find_data_address_in_chunk(device_extension* Vcb, chunk* c, uint64_t length
 
 __attribute__((nonnull(1)))
 chunk* get_chunk_from_address(device_extension* Vcb, uint64_t address) {
-    LIST_ENTRY* le2;
+    uint32_t h = get_chunk_hash(address);
 
     ExAcquireResourceSharedLite(&Vcb->chunk_lock, true);
 
-    le2 = Vcb->chunks.Flink;
-    while (le2 != &Vcb->chunks) {
-        chunk* c = CONTAINING_RECORD(le2, chunk, list_entry);
+    // Search the target bucket first (O(1) fast path)
+    {
+        LIST_ENTRY* le = Vcb->chunks_hash_table[h].Flink;
+        while (le != &Vcb->chunks_hash_table[h]) {
+            chunk* c = CONTAINING_RECORD(le, chunk, list_entry_hash);
 
-        if (address >= c->offset && address < c->offset + c->chunk_item->size) {
-            ExReleaseResourceLite(&Vcb->chunk_lock);
-            return c;
+            if (address >= c->offset && address < c->offset + c->chunk_item->size) {
+                ExReleaseResourceLite(&Vcb->chunk_lock);
+                return c;
+            }
+
+            le = le->Flink;
         }
+    }
 
-        le2 = le2->Flink;
+    // The chunk's offset may hash to a different bucket than the address.
+    // Search backward through previous buckets to find it.
+    for (uint32_t i = 1; i < CHUNK_HASH_TABLE_SIZE; i++) {
+        uint32_t bucket = (h + CHUNK_HASH_TABLE_SIZE - i) % CHUNK_HASH_TABLE_SIZE;
+        LIST_ENTRY* le = Vcb->chunks_hash_table[bucket].Flink;
+
+        while (le != &Vcb->chunks_hash_table[bucket]) {
+            chunk* c = CONTAINING_RECORD(le, chunk, list_entry_hash);
+
+            if (address >= c->offset && address < c->offset + c->chunk_item->size) {
+                ExReleaseResourceLite(&Vcb->chunk_lock);
+                return c;
+            }
+
+            // If this chunk ends before or at the address, it's too small — keep scanning.
+            // If this chunk starts after the address, no chunk in this bucket can contain it.
+            if (c->offset > address)
+                break;
+
+            le = le->Flink;
+        }
     }
 
     ExReleaseResourceLite(&Vcb->chunk_lock);
@@ -697,6 +723,8 @@ end:
 
         if (!done)
             InsertTailList(&Vcb->chunks, &c->list_entry);
+
+        chunk_hash_insert(Vcb, c);
 
         c->created = true;
         c->changed = true;
@@ -1915,6 +1943,8 @@ NTSTATUS write_data(_In_ device_extension* Vcb, _In_ uint64_t address, _In_reads
     uint64_t total_writing = 0;
     ULONG allowed_missing, missing;
 
+    wtc->Vcb = Vcb;
+
     TRACE("(%p, %I64x, %p, %x)\n", Vcb, address, data, length);
 
     if (!c) {
@@ -2034,7 +2064,7 @@ NTSTATUS write_data(_In_ device_extension* Vcb, _In_ uint64_t address, _In_reads
         write_data_stripe* stripe;
         PIO_STACK_LOCATION IrpSp;
 
-        stripe = ExAllocatePoolWithTag(NonPagedPool, sizeof(write_data_stripe), ALLOC_TAG);
+        stripe = (write_data_stripe*)ExAllocateFromNPagedLookasideList(&Vcb->write_data_stripe_lookaside);
         if (!stripe) {
             ERR("out of memory\n");
             Status = STATUS_INSUFFICIENT_RESOURCES;
@@ -2059,7 +2089,7 @@ NTSTATUS write_data(_In_ device_extension* Vcb, _In_ uint64_t address, _In_reads
 
                 if (!stripe->Irp) {
                     ERR("IoAllocateIrp failed\n");
-                    ExFreePool(stripe);
+                    ExFreeToNPagedLookasideList(&Vcb->write_data_stripe_lookaside, stripe);
                     Status = STATUS_INSUFFICIENT_RESOURCES;
                     goto end;
                 }
@@ -2068,7 +2098,7 @@ NTSTATUS write_data(_In_ device_extension* Vcb, _In_ uint64_t address, _In_reads
 
                 if (!stripe->Irp) {
                     ERR("IoMakeAssociatedIrp failed\n");
-                    ExFreePool(stripe);
+                    ExFreeToNPagedLookasideList(&Vcb->write_data_stripe_lookaside, stripe);
                     Status = STATUS_INSUFFICIENT_RESOURCES;
                     goto end;
                 }
@@ -2203,6 +2233,7 @@ NTSTATUS write_data_complete(device_extension* Vcb, uint64_t address, void* data
     wtc.stripes_left = 0;
     wtc.parity1 = wtc.parity2 = wtc.scratch = NULL;
     wtc.mdl = wtc.parity1_mdl = wtc.parity2_mdl = NULL;
+    wtc.Vcb = Vcb;
 
     if (!c) {
         c = get_chunk_from_address(Vcb, address);
@@ -2376,7 +2407,7 @@ void free_write_data_stripes(write_data_context* wtc) {
     while (!IsListEmpty(&wtc->stripes)) {
         write_data_stripe* stripe = CONTAINING_RECORD(RemoveHeadList(&wtc->stripes), write_data_stripe, list_entry);
 
-        ExFreePool(stripe);
+        ExFreeToNPagedLookasideList(&wtc->Vcb->write_data_stripe_lookaside, stripe);
     }
 }
 
@@ -4727,6 +4758,17 @@ NTSTATUS __stdcall drv_write(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp) {
         Status = STATUS_MEDIA_WRITE_PROTECTED;
         goto end;
     }
+
+    // NOTA: subvol_lock NO se integra aquí (a nivel drv_write) porque write_file2()
+    // adquiere tree_lock shared internamente. Agregar subvol_lock aquí crearía un
+    // orden: subvol_lock -> tree_lock, lo cual viola la jerarquía establecía
+    // tree_lock -> subvol_lock y causaría deadlock con el flush thread
+    // (que toma tree_lock exclusive).
+    //
+    // Para integrar subvol_lock en escritura, debería hacerse dentro de write_file2()
+    // DESPUÉS de que tree_lock se haya adquirido, reemplazando tree_lock shared
+    // por subvol_lock exclusive en paths que solo tocan un subvolumen.
+    // Esto requiere un análisis más profundo de write_file2() y sus callers.
 
     try {
         if (IrpSp->MinorFunction & IRP_MN_COMPLETE) {

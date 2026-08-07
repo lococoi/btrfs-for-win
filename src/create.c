@@ -30,7 +30,8 @@ static const WCHAR datastring[] = L"::$DATA";
 static const char root_dir[] = "$Root";
 static const WCHAR root_dir_utf16[] = L"$Root";
 
-// Windows 10
+#ifndef _MSC_VER
+// Windows 10 - these are provided by WDK when using MSVC
 #define ATOMIC_CREATE_ECP_IN_FLAG_REPARSE_POINT_SPECIFIED   0x0002
 #define ATOMIC_CREATE_ECP_IN_FLAG_OP_FLAGS_SPECIFIED        0x0080
 #define ATOMIC_CREATE_ECP_IN_FLAG_BEST_EFFORT               0x0100
@@ -73,6 +74,7 @@ typedef struct _ATOMIC_CREATE_ECP_CONTEXT {
     ULONG InCaseSensitiveFlags;
     ULONG OutCaseSensitiveFlags;
 } ATOMIC_CREATE_ECP_CONTEXT, *PATOMIC_CREATE_ECP_CONTEXT;
+#endif
 
 static const GUID GUID_ECP_ATOMIC_CREATE = { 0x4720bd83, 0x52ac, 0x4104, { 0xa1, 0x30, 0xd1, 0xec, 0x6a, 0x8c, 0xc8, 0xe5 } };
 static const GUID GUID_ECP_QUERY_ON_CREATE = { 0x1aca62e9, 0xabb4, 0x4ff2, { 0xbb, 0x5c, 0x1c, 0x79, 0x02, 0x5e, 0x41, 0x7f } };

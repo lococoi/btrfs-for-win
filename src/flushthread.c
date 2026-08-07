@@ -31,6 +31,11 @@
 
 #define BATCH_ITEM_LIMIT 1000
 
+// Minimum number of tree nodes to justify creating parallel worker threads
+// for checksum computation. Below this threshold, checksums are computed
+// sequentially on the calling thread.
+#define TREE_CSUM_PARALLEL_THRESHOLD 8
+
 typedef struct {
     KEVENT Event;
     IO_STATUS_BLOCK iosb;
@@ -1617,7 +1622,34 @@ static NTSTATUS update_root_root(device_extension* Vcb, bool no_cache, PIRP Irp,
     return STATUS_SUCCESS;
 }
 
-NTSTATUS do_tree_writes(device_extension* Vcb, LIST_ENTRY* tree_writes, bool no_free) {
+// =============================================================================
+// Phase 3.2 - Flush asíncrono: Lanzamiento y espera separados
+// =============================================================================
+//
+// do_tree_writes() se divide en dos funciones:
+//   - launch_tree_writes(): merge, alloc wtc, write_data, IoCallDriver (sin esperar)
+//   - wait_tree_writes(): KeWaitForSingleObject, check results, free wtc, raid56
+//
+// Esto permite que el flush thread lance todas las escrituras de árboles,
+// libere tree_lock, y ESPERE por los I/Os sin mantener el lock.
+// =============================================================================
+
+// Holds pending async tree write I/O state for deferred completion.
+// After launching tree writes via launch_tree_writes(), the caller must
+// call wait_tree_writes() to complete, then free the tree_writes data list.
+typedef struct {
+    write_data_context* wtc;     // Array of write_data_context for each tree write
+    ULONG num_bits;              // Number of entries in wtc array
+    bool raid56;                 // Whether any writes involve RAID56
+    LIST_ENTRY tree_writes;      // List of tree_write entries to be freed after I/O completion
+} pending_tree_writes;
+
+// Merges adjacent tree writes, allocates write_data_context array,
+// and launches all I/Os WITHOUT waiting for completion.
+// Caller must call wait_tree_writes() to complete the operation.
+static NTSTATUS launch_tree_writes(device_extension* Vcb, LIST_ENTRY* tree_writes, bool no_free,
+                                    write_data_context** out_wtc, ULONG* out_num_bits,
+                                    bool* out_raid56) {
     chunk* c;
     LIST_ENTRY* le;
     tree_write* tw;
@@ -1679,10 +1711,7 @@ NTSTATUS do_tree_writes(device_extension* Vcb, LIST_ENTRY* tree_writes, bool no_
 
     le = tree_writes->Flink;
     while (le != tree_writes) {
-        tw = CONTAINING_RECORD(le, tree_write, list_entry);
-
         num_bits++;
-
         le = le->Flink;
     }
 
@@ -1723,9 +1752,9 @@ NTSTATUS do_tree_writes(device_extension* Vcb, LIST_ENTRY* tree_writes, bool no_
         le = le->Flink;
     }
 
+    // Launch all I/Os (without waiting)
     for (i = 0; i < num_bits; i++) {
         if (wtc[i].stripes.Flink != &wtc[i].stripes) {
-            // launch writes and wait
             le = wtc[i].stripes.Flink;
             while (le != &wtc[i].stripes) {
                 write_data_stripe* stripe = CONTAINING_RECORD(le, write_data_stripe, list_entry);
@@ -1739,6 +1768,23 @@ NTSTATUS do_tree_writes(device_extension* Vcb, LIST_ENTRY* tree_writes, bool no_
             }
         }
     }
+
+    *out_wtc = wtc;
+    *out_num_bits = num_bits;
+    *out_raid56 = raid56;
+
+    return STATUS_SUCCESS;
+}
+
+// Waits for all tree write I/Os to complete, checks results, frees wtc,
+// and handles RAID56 partial stripe flushing.
+// This can be called WITHOUT tree_lock held, allowing I/O to proceed
+// while the flush thread waits.
+static NTSTATUS wait_tree_writes(device_extension* Vcb, write_data_context* wtc,
+                                  ULONG num_bits, bool raid56, LIST_ENTRY* tree_writes) {
+    ULONG i;
+    NTSTATUS Status = STATUS_SUCCESS;
+    LIST_ENTRY* le;
 
     for (i = 0; i < num_bits; i++) {
         if (wtc[i].need_wait)
@@ -1765,11 +1811,11 @@ NTSTATUS do_tree_writes(device_extension* Vcb, LIST_ENTRY* tree_writes, bool no_
     ExFreePool(wtc);
 
     if (raid56) {
-        c = NULL;
+        chunk* c = NULL;
 
         le = tree_writes->Flink;
         while (le != tree_writes) {
-            tw = CONTAINING_RECORD(le, tree_write, list_entry);
+            tree_write* tw = CONTAINING_RECORD(le, tree_write, list_entry);
 
             if (tw->c != c) {
                 c = tw->c;
@@ -1803,6 +1849,21 @@ NTSTATUS do_tree_writes(device_extension* Vcb, LIST_ENTRY* tree_writes, bool no_
     return STATUS_SUCCESS;
 }
 
+// Synchronous wrapper: launches and waits (original do_tree_writes behavior).
+// Preserved for callers that need synchronous operation (balance.c, etc.).
+NTSTATUS do_tree_writes(device_extension* Vcb, LIST_ENTRY* tree_writes, bool no_free) {
+    write_data_context* wtc;
+    ULONG num_bits;
+    bool raid56;
+    NTSTATUS Status;
+
+    Status = launch_tree_writes(Vcb, tree_writes, no_free, &wtc, &num_bits, &raid56);
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    return wait_tree_writes(Vcb, wtc, num_bits, raid56, tree_writes);
+}
+
 void calc_tree_checksum(device_extension* Vcb, tree_header* th) {
     switch (Vcb->superblock.csum_type) {
         case CSUM_TYPE_CRC32C:
@@ -1823,17 +1884,185 @@ void calc_tree_checksum(device_extension* Vcb, tree_header* th) {
     }
 }
 
-static NTSTATUS write_trees(device_extension* Vcb, PIRP Irp) {
+// --- Parallel tree checksum infrastructure ---
+//
+// The existing calc thread system (calcthread.c) is designed for sector-level
+// checksums where each job processes sector_size bytes via calc_thread_crc32c
+// etc. Tree checksums are fundamentally different: each B-tree node is
+// node_size bytes (typically 16 KB) and the checksum covers
+// node_size - sizeof(csum) bytes, written in-place at offset 0 of the node.
+//
+// The calc_thread_crc32c handler hardcodes Vcb->superblock.sector_size for both
+// the pointer advance and the CRC length, making it incompatible with tree node
+// checksums. Adding a new calc_thread_type would require modifying btrfs_drv.h
+// and calcthread.c, which is outside the scope of this change.
+//
+// Instead, we use temporary system threads with an atomic work-distribution
+// counter. Each thread pulls the next unprocessed node via InterlockedIncrement
+// and calls calc_tree_checksum(). The calling (flush) thread also participates
+// as a worker to avoid idling.
+
+typedef struct {
+    device_extension* Vcb;
+    tree_header** nodes;
+    uint32_t count;
+    volatile LONG next_index;
+    KEVENT done_event;
+    volatile LONG workers_left;
+} tree_csum_batch;
+
+_Function_class_(KSTART_ROUTINE)
+static void __stdcall tree_csum_worker(void* context) {
+    tree_csum_batch* batch = (tree_csum_batch*)context;
+
+    while (true) {
+        LONG idx = InterlockedIncrement(&batch->next_index) - 1;
+        if (idx >= (LONG)batch->count)
+            break;
+
+        calc_tree_checksum(batch->Vcb, batch->nodes[idx]);
+    }
+
+    if (InterlockedDecrement(&batch->workers_left) == 0)
+        KeSetEvent(&batch->done_event, 0, false);
+}
+
+static void dispatch_tree_checksums_batch(device_extension* Vcb, LIST_ENTRY* tree_writes) {
+    uint32_t count = 0;
+    uint32_t i, num_workers;
+    LIST_ENTRY* le;
+    tree_header** nodes;
+    HANDLE* thread_handles;
+    tree_csum_batch batch;
+
+    // Count tree write entries
+    for (le = tree_writes->Flink; le != tree_writes; le = le->Flink)
+        count++;
+
+    if (count == 0)
+        return;
+
+    // Sequential path for small batches — thread creation overhead would
+    // outweigh the parallelism benefit.
+    if (count < TREE_CSUM_PARALLEL_THRESHOLD) {
+        for (le = tree_writes->Flink; le != tree_writes; le = le->Flink) {
+            tree_write* tw = CONTAINING_RECORD(le, tree_write, list_entry);
+            calc_tree_checksum(Vcb, (tree_header*)tw->data);
+        }
+        return;
+    }
+
+    // Allocate array of node pointers for workers to index into
+    nodes = ExAllocatePoolWithTag(NonPagedPool, count * sizeof(tree_header*), ALLOC_TAG);
+    if (!nodes) {
+        ERR("out of memory for tree csum batch, falling back to sequential\n");
+        goto fallback_sequential;
+    }
+
+    i = 0;
+    for (le = tree_writes->Flink; le != tree_writes; le = le->Flink) {
+        tree_write* tw = CONTAINING_RECORD(le, tree_write, list_entry);
+        nodes[i++] = (tree_header*)tw->data;
+    }
+
+    // Determine worker count based on existing calc thread pool.
+    // Clamp to [2, min(count, 16)] to avoid excessive thread creation.
+    num_workers = Vcb->calcthreads.num_threads;
+    if (num_workers < 2)
+        num_workers = 2;
+    if (num_workers > count)
+        num_workers = count;
+    if (num_workers > 16)
+        num_workers = 16;
+
+    thread_handles = ExAllocatePoolWithTag(NonPagedPool, num_workers * sizeof(HANDLE), ALLOC_TAG);
+    if (!thread_handles) {
+        ERR("out of memory for tree csum thread handles, falling back to sequential\n");
+        ExFreePool(nodes);
+        goto fallback_sequential;
+    }
+
+    // Initialize batch context
+    batch.Vcb = Vcb;
+    batch.nodes = nodes;
+    batch.count = count;
+    batch.next_index = 0;
+    batch.workers_left = num_workers + 1; // +1 for the calling thread
+    KeInitializeEvent(&batch.done_event, NotificationEvent, false);
+
+    // Create worker system threads
+    for (i = 0; i < num_workers; i++) {
+        NTSTATUS Status = PsCreateSystemThread(&thread_handles[i], THREAD_ALL_ACCESS,
+                                                NULL, NULL, NULL,
+                                                (PKSTART_ROUTINE)tree_csum_worker, &batch);
+        if (!NT_SUCCESS(Status)) {
+            ERR("PsCreateSystemThread failed for tree csum worker: %08lx\n", Status);
+            thread_handles[i] = NULL;
+            // This worker slot is lost; account for it
+            if (InterlockedDecrement(&batch.workers_left) == 0)
+                KeSetEvent(&batch.done_event, 0, false);
+        }
+    }
+
+    // The calling (flush) thread also participates as a worker
+    while (true) {
+        LONG idx = InterlockedIncrement(&batch.next_index) - 1;
+        if (idx >= (LONG)batch.count)
+            break;
+
+        calc_tree_checksum(Vcb, batch.nodes[idx]);
+    }
+
+    // Signal calling thread's contribution is done
+    if (InterlockedDecrement(&batch.workers_left) == 0)
+        KeSetEvent(&batch.done_event, 0, false);
+
+    // Wait for all workers to complete
+    KeWaitForSingleObject(&batch.done_event, Executive, KernelMode, false, NULL);
+
+    // Clean up thread handles
+    for (i = 0; i < num_workers; i++) {
+        if (thread_handles[i])
+            ZwClose(thread_handles[i]);
+    }
+
+    ExFreePool(thread_handles);
+    ExFreePool(nodes);
+    return;
+
+fallback_sequential:
+    for (le = tree_writes->Flink; le != tree_writes; le = le->Flink) {
+        tree_write* tw = CONTAINING_RECORD(le, tree_write, list_entry);
+        calc_tree_checksum(Vcb, (tree_header*)tw->data);
+    }
+}
+
+// Writes all dirty tree nodes to disk.
+// When pending is non-NULL, launches tree writes without waiting and stores
+// the I/O state in *pending. The caller must later call wait_tree_writes()
+// and free the tree_writes data list.
+// When pending is NULL, operates synchronously (original behavior).
+static NTSTATUS write_trees(device_extension* Vcb, PIRP Irp, pending_tree_writes* pending) {
     ULONG level;
     uint8_t *data, *body;
     NTSTATUS Status;
     LIST_ENTRY* le;
-    LIST_ENTRY tree_writes;
+    LIST_ENTRY tree_writes_local;
+    LIST_ENTRY* tree_writes;
     tree_write* tw;
 
     TRACE("(%p)\n", Vcb);
 
-    InitializeListHead(&tree_writes);
+    if (pending) {
+        InitializeListHead(&pending->tree_writes);
+        tree_writes = &pending->tree_writes;
+        pending->wtc = NULL;
+        pending->num_bits = 0;
+        pending->raid56 = false;
+    } else {
+        InitializeListHead(&tree_writes_local);
+        tree_writes = &tree_writes_local;
+    }
 
     for (level = 0; level <= 255; level++) {
         bool nothing_found = true;
@@ -1997,7 +2226,7 @@ static NTSTATUS write_trees(device_extension* Vcb, PIRP Irp) {
             if (!data) {
                 ERR("out of memory\n");
                 Status = STATUS_INSUFFICIENT_RESOURCES;
-                goto end;
+                goto cleanup_data;
             }
 
             body = data + sizeof(tree_header);
@@ -2045,14 +2274,15 @@ static NTSTATUS write_trees(device_extension* Vcb, PIRP Irp) {
                 }
             }
 
-            calc_tree_checksum(Vcb, (tree_header*)data);
+            // Checksum is deferred — computed in parallel after all nodes are built.
+            // See dispatch_tree_checksums_batch() below.
 
             tw = ExAllocatePoolWithTag(PagedPool, sizeof(tree_write), ALLOC_TAG);
             if (!tw) {
                 ERR("out of memory\n");
                 ExFreePool(data);
                 Status = STATUS_INSUFFICIENT_RESOURCES;
-                goto end;
+                goto cleanup_data;
             }
 
             tw->address = t->new_address;
@@ -2060,13 +2290,13 @@ static NTSTATUS write_trees(device_extension* Vcb, PIRP Irp) {
             tw->data = data;
             tw->allocated = false;
 
-            if (IsListEmpty(&tree_writes))
-                InsertTailList(&tree_writes, &tw->list_entry);
+            if (IsListEmpty(tree_writes))
+                InsertTailList(tree_writes, &tw->list_entry);
             else {
                 bool inserted = false;
 
-                le2 = tree_writes.Flink;
-                while (le2 != &tree_writes) {
+                le2 = tree_writes->Flink;
+                while (le2 != tree_writes) {
                     tree_write* tw2 = CONTAINING_RECORD(le2, tree_write, list_entry);
 
                     if (tw2->address > tw->address) {
@@ -2079,24 +2309,41 @@ static NTSTATUS write_trees(device_extension* Vcb, PIRP Irp) {
                 }
 
                 if (!inserted)
-                    InsertTailList(&tree_writes, &tw->list_entry);
+                    InsertTailList(tree_writes, &tw->list_entry);
             }
         }
 
         le = le->Flink;
     }
 
-    Status = do_tree_writes(Vcb, &tree_writes, false);
+    // Compute all tree node checksums in parallel before writing to disk.
+    // Each node's checksum is independent (no cross-node dependencies),
+    // so this is safe to parallelize freely.
+    dispatch_tree_checksums_batch(Vcb, tree_writes);
+
+    if (pending) {
+        // Async mode: launch tree writes without waiting.
+        // The caller is responsible for calling wait_tree_writes() and freeing data.
+        Status = launch_tree_writes(Vcb, tree_writes, false, &pending->wtc, &pending->num_bits, &pending->raid56);
+        if (!NT_SUCCESS(Status)) {
+            ERR("launch_tree_writes returned %08lx\n", Status);
+            goto cleanup_data;
+        }
+        return STATUS_SUCCESS;
+    }
+
+    // Sync mode: launch and wait
+    Status = do_tree_writes(Vcb, tree_writes, false);
     if (!NT_SUCCESS(Status)) {
         ERR("do_tree_writes returned %08lx\n", Status);
-        goto end;
+        goto cleanup_data;
     }
 
     Status = STATUS_SUCCESS;
 
-end:
-    while (!IsListEmpty(&tree_writes)) {
-        le = RemoveHeadList(&tree_writes);
+cleanup_data:
+    while (!IsListEmpty(tree_writes)) {
+        le = RemoveHeadList(tree_writes);
         tw = CONTAINING_RECORD(le, tree_write, list_entry);
 
         if (tw->data)
@@ -2192,6 +2439,40 @@ typedef struct _write_superblocks_context {
     LIST_ENTRY stripes;
     LONG left;
 } write_superblocks_context;
+
+// Holds pending async superblock write state for deferred completion.
+// After launching superblock writes, the caller must call wait_superblocks()
+// to complete, then free the context with free_superblocks_context().
+typedef struct {
+    write_superblocks_context* context;  // Heap-allocated context (NULL if invalid)
+} pending_superblocks;
+
+// Frees all resources associated with a superblocks context.
+static void free_superblocks_context(write_superblocks_context* context) {
+    if (!context)
+        return;
+
+    while (!IsListEmpty(&context->stripes)) {
+        write_superblocks_stripe* stripe = CONTAINING_RECORD(RemoveHeadList(&context->stripes), write_superblocks_stripe, list_entry);
+
+        if (stripe->mdl) {
+            if (stripe->mdl->MdlFlags & MDL_PAGES_LOCKED)
+                MmUnlockPages(stripe->mdl);
+
+            IoFreeMdl(stripe->mdl);
+        }
+
+        if (stripe->Irp)
+            IoFreeIrp(stripe->Irp);
+
+        if (stripe->buf)
+            ExFreePool(stripe->buf);
+
+        ExFreePool(stripe);
+    }
+
+    ExFreePool(context);
+}
 
 _Function_class_(IO_COMPLETION_ROUTINE)
 static NTSTATUS __stdcall write_superblock_completion(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID conptr) {
@@ -2323,11 +2604,16 @@ static NTSTATUS write_superblock(device_extension* Vcb, device* device, write_su
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS write_superblocks(device_extension* Vcb, PIRP Irp) {
+// Prepares superblock metadata (root addresses, backups) and launches all
+// superblock I/Os without waiting for completion.
+// Caller must call wait_superblocks() to complete, then free the context.
+// The returned context is heap-allocated and must be freed by the caller.
+static NTSTATUS setup_and_launch_superblocks(device_extension* Vcb, PIRP Irp,
+                                              write_superblocks_context** out_context) {
     uint64_t i;
     NTSTATUS Status;
     LIST_ENTRY* le;
-    write_superblocks_context context;
+    write_superblocks_context* context;
 
     TRACE("(%p)\n", Vcb);
 
@@ -2355,33 +2641,41 @@ static NTSTATUS write_superblocks(device_extension* Vcb, PIRP Irp) {
 
     update_backup_superblock(Vcb, &Vcb->superblock.backup[BTRFS_NUM_BACKUP_ROOTS - 1], Irp);
 
-    KeInitializeEvent(&context.Event, NotificationEvent, false);
-    InitializeListHead(&context.stripes);
-    context.left = 0;
+    context = ExAllocatePoolWithTag(NonPagedPool, sizeof(write_superblocks_context), ALLOC_TAG);
+    if (!context) {
+        ERR("out of memory\n");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    KeInitializeEvent(&context->Event, NotificationEvent, false);
+    InitializeListHead(&context->stripes);
+    context->left = 0;
 
     le = Vcb->devices.Flink;
     while (le != &Vcb->devices) {
         device* dev = CONTAINING_RECORD(le, device, list_entry);
 
         if (dev->devobj && !dev->readonly) {
-            Status = write_superblock(Vcb, dev, &context);
+            Status = write_superblock(Vcb, dev, context);
             if (!NT_SUCCESS(Status)) {
                 ERR("write_superblock returned %08lx\n", Status);
-                goto end;
+                free_superblocks_context(context);
+                return Status;
             }
         }
 
         le = le->Flink;
     }
 
-    if (IsListEmpty(&context.stripes)) {
+    if (IsListEmpty(&context->stripes)) {
         ERR("error - not writing any superblocks\n");
-        Status = STATUS_INTERNAL_ERROR;
-        goto end;
+        free_superblocks_context(context);
+        return STATUS_INTERNAL_ERROR;
     }
 
-    le = context.stripes.Flink;
-    while (le != &context.stripes) {
+    // Launch all I/Os (without waiting)
+    le = context->stripes.Flink;
+    while (le != &context->stripes) {
         write_superblocks_stripe* stripe = CONTAINING_RECORD(le, write_superblocks_stripe, list_entry);
 
         IoCallDriver(stripe->device->devobj, stripe->Irp);
@@ -2389,43 +2683,47 @@ static NTSTATUS write_superblocks(device_extension* Vcb, PIRP Irp) {
         le = le->Flink;
     }
 
-    KeWaitForSingleObject(&context.Event, Executive, KernelMode, false, NULL);
+    *out_context = context;
+    return STATUS_SUCCESS;
+}
 
-    le = context.stripes.Flink;
-    while (le != &context.stripes) {
+// Waits for all superblock I/Os to complete and checks results.
+// This can be called WITHOUT tree_lock held.
+// After this call, the context should be freed with free_superblocks_context().
+static NTSTATUS wait_superblocks(device_extension* Vcb, write_superblocks_context* context) {
+    NTSTATUS Status = STATUS_SUCCESS;
+    LIST_ENTRY* le;
+
+    KeWaitForSingleObject(&context->Event, Executive, KernelMode, false, NULL);
+
+    le = context->stripes.Flink;
+    while (le != &context->stripes) {
         write_superblocks_stripe* stripe = CONTAINING_RECORD(le, write_superblocks_stripe, list_entry);
 
         if (!NT_SUCCESS(stripe->Status)) {
             ERR("device %I64x returned %08lx\n", stripe->device->devitem.dev_id, stripe->Status);
             log_device_error(Vcb, stripe->device, BTRFS_DEV_STAT_WRITE_ERRORS);
             Status = stripe->Status;
-            goto end;
+            break;
         }
 
         le = le->Flink;
     }
 
-    Status = STATUS_SUCCESS;
+    return Status;
+}
 
-end:
-    while (!IsListEmpty(&context.stripes)) {
-        write_superblocks_stripe* stripe = CONTAINING_RECORD(RemoveHeadList(&context.stripes), write_superblocks_stripe, list_entry);
+// Synchronous wrapper: prepares, launches, and waits (original behavior).
+static NTSTATUS write_superblocks(device_extension* Vcb, PIRP Irp) {
+    write_superblocks_context* context;
+    NTSTATUS Status;
 
-        if (stripe->mdl) {
-            if (stripe->mdl->MdlFlags & MDL_PAGES_LOCKED)
-                MmUnlockPages(stripe->mdl);
+    Status = setup_and_launch_superblocks(Vcb, Irp, &context);
+    if (!NT_SUCCESS(Status))
+        return Status;
 
-            IoFreeMdl(stripe->mdl);
-        }
-
-        if (stripe->Irp)
-            IoFreeIrp(stripe->Irp);
-
-        if (stripe->buf)
-            ExFreePool(stripe->buf);
-
-        ExFreePool(stripe);
-    }
+    Status = wait_superblocks(Vcb, context);
+    free_superblocks_context(context);
 
     return Status;
 }
@@ -3205,11 +3503,48 @@ end:
 static NTSTATUS split_tree(device_extension* Vcb, tree* t) {
     LIST_ENTRY* le;
     uint32_t size, ds, numitems;
+    uint32_t max_size = Vcb->superblock.node_size - sizeof(tree_header);
+    uint32_t total_size = 0;
+    uint32_t target_size;
 
     size = 0;
     numitems = 0;
 
-    // FIXME - naïve implementation: maximizes number of filled trees
+    // Adaptive split: two-pass algorithm for balanced node distribution.
+    //
+    // Pass 1: Calculate total size of all items in the node to determine
+    //         the optimal split point (approximately 50% of total).
+    // Pass 2: Find the item boundary closest to the 50% target, ensuring
+    //         both resulting nodes fit within max_size.
+    //
+    // Benefits over naïve (fill-to-capacity) approach:
+    //   - Both resulting nodes have ~50% free space for future insertions
+    //   - Reduces split frequency by ~2x (each node can absorb ~2x inserts
+    //     before needing another split)
+    //   - More balanced tree depth improves search and traversal performance
+    //   - Better cache utilization due to more uniform node fill ratios
+
+    // Pass 1: compute total size of all items in this node
+    le = t->itemlist.Flink;
+    while (le != &t->itemlist) {
+        tree_data* td = CONTAINING_RECORD(le, tree_data, list_entry);
+
+        if (!td->ignore) {
+            if (t->header.level == 0)
+                total_size += sizeof(leaf_node) + td->size;
+            else
+                total_size += sizeof(internal_node);
+        }
+
+        le = le->Flink;
+    }
+
+    // Target split point: 50% of total for balanced distribution
+    target_size = total_size / 2;
+
+    // Pass 2: find the split point closest to target_size
+    size = 0;
+    numitems = 0;
 
     le = t->itemlist.Flink;
     while (le != &t->itemlist) {
@@ -3221,19 +3556,54 @@ static NTSTATUS split_tree(device_extension* Vcb, tree* t) {
             else
                 ds = sizeof(internal_node);
 
-            if (numitems == 0 && ds > Vcb->superblock.node_size - sizeof(tree_header)) {
+            if (numitems == 0 && ds > max_size) {
                 ERR("(%I64x,%x,%I64x) in tree %I64x is too large (%x > %Ix)\n",
                     td->key.obj_id, td->key.obj_type, td->key.offset, t->root->id,
-                    ds, Vcb->superblock.node_size - sizeof(tree_header));
+                    ds, max_size);
                 return STATUS_INTERNAL_ERROR;
             }
 
-            // FIXME - move back if previous item was deleted item with same key
-            if (size + ds > Vcb->superblock.node_size - sizeof(tree_header))
+            // Hard limit: this item would overflow the node — must split here
+            if (size + ds > max_size) {
+                // FIXME - move back if previous item was deleted item with same key
                 return split_tree_at(Vcb, t, td, numitems, size);
+            }
 
             size += ds;
             numitems++;
+
+            // Adaptive split: once we've accumulated >= 50% of total and
+            // there are more items remaining, split here for a balanced result.
+            // The next item becomes the first item in the new node.
+            if (size >= target_size && le->Flink != &t->itemlist) {
+                LIST_ENTRY* nextle = le->Flink;
+                while (nextle != &t->itemlist) {
+                    tree_data* next_td = CONTAINING_RECORD(nextle, tree_data, list_entry);
+
+                    if (!next_td->ignore) {
+                        // Check that splitting at next_td doesn't cause the
+                        // second node to exceed max_size with a single item.
+                        // If it would, continue accumulating (the hard limit
+                        // above will trigger if truly necessary).
+                        uint32_t next_ds;
+
+                        if (t->header.level == 0)
+                            next_ds = sizeof(leaf_node) + next_td->size;
+                        else
+                            next_ds = sizeof(internal_node);
+
+                        if (next_ds <= max_size) {
+                            return split_tree_at(Vcb, t, next_td, numitems, size);
+                        }
+
+                        // Single item too large for balanced split — continue
+                        // accumulating to avoid creating an invalid node.
+                        break;
+                    }
+
+                    nextle = nextle->Flink;
+                }
+            }
         }
 
         le = le->Flink;
@@ -5757,6 +6127,7 @@ static NTSTATUS drop_chunk(device_extension* Vcb, chunk* c, LIST_ENTRY* batchlis
     if (c->chunk_item->type & BLOCK_FLAG_SYSTEM)
         remove_from_bootstrap(Vcb, 0x100, TYPE_CHUNK_ITEM, c->offset);
 
+    chunk_hash_remove(c);
     RemoveEntryList(&c->list_entry);
 
     // clear raid56 incompat flag if dropping last RAID5/6 chunk
@@ -7478,7 +7849,30 @@ static NTSTATUS check_for_orphans(device_extension* Vcb, PIRP Irp) {
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS do_write2(device_extension* Vcb, PIRP Irp, LIST_ENTRY* rollback) {
+// do_write2: Función principal de escritura del flush thread.
+//
+// LOCKING: Esta función DEBE ser llamada con Vcb->tree_lock adquirido
+// exclusivamente. tree_lock se requiere porque:
+// - Se modifican dirty_fcbs, dirty_filerefs, dirty_subvols (listas globales)
+// - flush_fcb() modifica checksum tree y extent tree (recursos globales)
+// - commit_batch_list() modifica el tree cache global (Vcb->trees)
+// - update_chunks() y write_trees() son operaciones cross-subvolume
+//
+// NOTA FASE 3.1: subvol_lock NO se usa aquí porque todas las operaciones
+// necesitan acceso al estado global del Vcb. subvol_lock está reservado
+// para el I/O path donde las operaciones solo tocan un subvol a la vez.
+// When pending_tcw and pending_sb are non-NULL, do_write2 operates in async mode:
+// it launches tree writes and superblock writes without waiting, stores the I/O
+// state in the output parameters, and returns. The caller must later:
+//   1. Wait for tree writes (wait_tree_writes)
+//   2. Wait for superblock writes (wait_superblocks)
+//   3. Free tree write data list
+//   4. Free superblock context (free_superblocks_context)
+//   5. Perform post-write cleanup (cleanup_after_write or do_write2_end_cleanup)
+//
+// When both are NULL, operates synchronously (original behavior).
+static NTSTATUS do_write2(device_extension* Vcb, PIRP Irp, LIST_ENTRY* rollback,
+                           pending_tree_writes* pending_tcw, write_superblocks_context** pending_sb) {
     NTSTATUS Status;
     LIST_ENTRY *le, batchlist;
     bool cache_changed = false;
@@ -7615,7 +8009,10 @@ static NTSTATUS do_write2(device_extension* Vcb, PIRP Irp, LIST_ENTRY* rollback)
     ERR("flushed %I64u fcbs in %I64u (freq = %I64u)\n", filerefs, time2.QuadPart - time1.QuadPart, freq.QuadPart);
 #endif
 
-    // no need to get dirty_subvols_lock here, as we have tree_lock exclusively
+    // No need to get dirty_subvols_lock here, as we have tree_lock exclusively.
+    // FASE 3.1: subvol_lock del subvol no se usa aquí porque flush_subvol()
+    // modifica estado cross-subvol (tree cache global). subvol_lock se usará
+    // en el I/O path para proteger solo operaciones de un solo subvol.
     while (!IsListEmpty(&Vcb->dirty_subvols)) {
         root* r = CONTAINING_RECORD(RemoveHeadList(&Vcb->dirty_subvols), root, list_entry_dirty);
 
@@ -7753,7 +8150,7 @@ static NTSTATUS do_write2(device_extension* Vcb, PIRP Irp, LIST_ENTRY* rollback)
         goto end;
     }
 
-    Status = write_trees(Vcb, Irp);
+    Status = write_trees(Vcb, Irp, pending_tcw);
     if (!NT_SUCCESS(Status)) {
         ERR("write_trees returned %08lx\n", Status);
         goto end;
@@ -7762,6 +8159,19 @@ static NTSTATUS do_write2(device_extension* Vcb, PIRP Irp, LIST_ENTRY* rollback)
     Status = test_not_full(Vcb);
     if (!NT_SUCCESS(Status)) {
         ERR("test_not_full returned %08lx\n", Status);
+        if (pending_tcw) {
+            // Async mode: tree writes are in flight, must wait before returning error
+            wait_tree_writes(Vcb, pending_tcw->wtc, pending_tcw->num_bits,
+                             pending_tcw->raid56, &pending_tcw->tree_writes);
+            pending_tcw->wtc = NULL;
+            // Free tree write data
+            while (!IsListEmpty(&pending_tcw->tree_writes)) {
+                le = RemoveHeadList(&pending_tcw->tree_writes);
+                tree_write* tw = CONTAINING_RECORD(le, tree_write, list_entry);
+                if (tw->data) ExFreePool(tw->data);
+                ExFreePool(tw);
+            }
+        }
         goto end;
     }
 
@@ -7809,12 +8219,35 @@ static NTSTATUS do_write2(device_extension* Vcb, PIRP Irp, LIST_ENTRY* rollback)
     if (!Vcb->options.no_barrier)
         flush_disk_caches(Vcb);
 
+    if (pending_sb) {
+        // Async mode: launch superblock writes without waiting
+        Status = setup_and_launch_superblocks(Vcb, Irp, pending_sb);
+        if (!NT_SUCCESS(Status)) {
+            ERR("setup_and_launch_superblocks returned %08lx\n", Status);
+            // Tree writes are in flight; must wait before returning error
+            wait_tree_writes(Vcb, pending_tcw->wtc, pending_tcw->num_bits,
+                             pending_tcw->raid56, &pending_tcw->tree_writes);
+            pending_tcw->wtc = NULL;
+            while (!IsListEmpty(&pending_tcw->tree_writes)) {
+                le = RemoveHeadList(&pending_tcw->tree_writes);
+                tree_write* tw = CONTAINING_RECORD(le, tree_write, list_entry);
+                if (tw->data) ExFreePool(tw->data);
+                ExFreePool(tw);
+            }
+            goto end;
+        }
+        // Return SUCCESS; caller will wait and do post-write cleanup
+        return STATUS_SUCCESS;
+    }
+
+    // Synchronous mode: original behavior
     Status = write_superblocks(Vcb, Irp);
     if (!NT_SUCCESS(Status)) {
         ERR("write_superblocks returned %08lx\n", Status);
         goto end;
     }
 
+    // Post-write cleanup (only in sync mode; async caller does this after waits)
     vde = Vcb->vde;
 
     if (vde) {
@@ -7873,6 +8306,28 @@ static NTSTATUS do_write2(device_extension* Vcb, PIRP Irp, LIST_ENTRY* rollback)
     }
 
 end:
+    // Phase 3.2: If we got here with in-flight async I/Os (e.g., error in
+    // DEBUG_PARANOID section after tree writes were launched), wait for them
+    // and clean up. This ensures no I/O is left dangling on error paths.
+    if (pending_tcw && pending_tcw->wtc) {
+        wait_tree_writes(Vcb, pending_tcw->wtc, pending_tcw->num_bits,
+                         pending_tcw->raid56, &pending_tcw->tree_writes);
+        pending_tcw->wtc = NULL;
+        while (!IsListEmpty(&pending_tcw->tree_writes)) {
+            LIST_ENTRY* le_end = RemoveHeadList(&pending_tcw->tree_writes);
+            tree_write* tw_end = CONTAINING_RECORD(le_end, tree_write, list_entry);
+            if (tw_end->data)
+                ExFreePool(tw_end->data);
+            ExFreePool(tw_end);
+        }
+    }
+
+    if (pending_sb && *pending_sb) {
+        wait_superblocks(Vcb, *pending_sb);
+        free_superblocks_context(*pending_sb);
+        *pending_sb = NULL;
+    }
+
     TRACE("do_write returning %08lx\n", Status);
 
     return Status;
@@ -7884,7 +8339,7 @@ NTSTATUS do_write(device_extension* Vcb, PIRP Irp) {
 
     InitializeListHead(&rollback);
 
-    Status = do_write2(Vcb, Irp, &rollback);
+    Status = do_write2(Vcb, Irp, &rollback, NULL, NULL);
 
     if (!NT_SUCCESS(Status)) {
         ERR("do_write2 returned %08lx, dropping into readonly mode\n", Status);
@@ -7897,22 +8352,287 @@ NTSTATUS do_write(device_extension* Vcb, PIRP Irp) {
     return Status;
 }
 
+// =============================================================================
+// Phase 3.1 - Granular tree_lock por subvolumen: Análisis y Diseño
+// =============================================================================
+//
+// ANÁLISIS DEL PROBLEMA:
+// do_flush() adquiere tree_lock exclusivo para TODO el flush thread, bloqueando
+// TODAS las operaciones de I/O del filesystem. El objetivo es permitir paralelismo
+// entre subvolúmenes.
+//
+// POR QUÉ EL LOCK EXCLUSIVO GLOBAL ES NECESARIO EN EL FLUSH PATH:
+//
+// 1. flush_fcb() modifica estado global:
+//    - add_checksum_entry() modifica el checksum root (global, compartido)
+//    - rationalize_extents() puede reasignar extentos (global)
+//    - insert_tree_item_batch() acumula cambios en el tree cache global
+//
+// 2. commit_batch_list() modifica el tree cache global (Vcb->trees):
+//    - Procesa batch items de TODOS los subvolúmenes
+//    - Modifica la estructura de árboles en memoria
+//
+// 3. update_chunks() es inherentemente cross-subvolume:
+//    - Modifica asignación de chunks compartidos entre subvolúmenes
+//    - Rebalance de espacio en disco
+//
+// 4. write_trees() itera TODOS los dirty trees (Vcb->trees):
+//    - Necesita coordinación global para escribir árboles modificados
+//
+// 5. write_superblocks() actualiza el superblock global:
+//    - Generación, parches de superbloque, etc.
+//
+// POR QUÉ NO SE PUEDE USAR subvol_lock EN EL FLUSH PATH:
+//
+// Aunque se itera sobre dirty_fcbs (que contiene fcbs de múltiples subvolúmenes),
+// cada flush_fcb() puede:
+// - Modificar el checksum root (global, no por subvol)
+// - Asignar extentos en el extent root (global)
+// - Agregar items al batchlist que serán procesados por commit_batch_list()
+//   (modifica el tree cache global)
+//
+// La jerarquía de locks establecida es: tree_lock -> subvol_lock
+// Nunca se adquiere subvol_lock sin tree_lock en el flush path.
+//
+// ESTRATEGIA IMPLEMENTADA (Fase 3.1):
+//
+// En vez de mantener tree_lock exclusivo durante TODO do_write2(), se divide
+// el flush en fases con tree_lock liberado entre ellas. Esto permite que
+// operaciones de I/O (lecturas) procedan brevemente entre fases del flush.
+//
+// Fase A: Escritura principal (flush de fcbs, subvols, chunks, trees)
+//   -> tree_lock exclusive durante todo do_write2()
+//   -> Permanece exclusivo porque cada paso modifica estado global
+//
+// Fase B: Liberación de trees
+//   -> tree_lock exclusive solo para free_trees()
+//   -> Separa la fase de escritura de la de limpieza
+//
+// RAZÓN POR LA QUE NO SE PUEDE DIVIDIR do_write2 EN FASES MÁS PEQUEÑAS:
+//
+// El loop de consistencia (do { update_chunks; allocate_cache; } while (...))
+// requiere que el estado del tree sea consistente entre iteraciones. Dividir
+// este loop en secciones con tree_lock liberado entre ellas crearía ventanas
+// donde otro thread podría modificar el tree cache, violando la consistencia.
+//
+// FUTURO (Fases 3.2+):
+//
+// subvol_lock se utilizará en el path de I/O (lectura/escritura de archivos):
+// - Operaciones de solo lectura de un subvol adquieren subvol_lock shared
+// - Permite paralelismo real: lee/subvol_A simultáneo con lee/subvol_B
+// - tree_lock shared se mantiene solo para acceso al tree cache global
+// - tree_lock exclusive se mantiene solo para operaciones de escritura
+//
+// =============================================================================
+
+// Post-write cleanup: updates children generations, clears flags,
+// marks trees as clean, increments generation, handles drop roots.
+// Must be called AFTER all I/O completes (tree writes + superblock writes).
+// Requires tree_lock exclusive for some operations.
+static void do_write2_end_cleanup(device_extension* Vcb) {
+    LIST_ENTRY* le;
+    volume_device_extension* vde;
+
+    vde = Vcb->vde;
+
+    if (vde) {
+        pdo_device_extension* pdode = vde->pdode;
+
+        ExAcquireResourceSharedLite(&pdode->child_lock, true);
+
+        le = pdode->children.Flink;
+
+        while (le != &pdode->children) {
+            volume_child* vc = CONTAINING_RECORD(le, volume_child, list_entry);
+
+            vc->generation = Vcb->superblock.generation;
+            le = le->Flink;
+        }
+
+        ExReleaseResourceLite(&pdode->child_lock);
+    }
+
+    clean_space_cache(Vcb);
+
+    le = Vcb->chunks.Flink;
+    while (le != &Vcb->chunks) {
+        chunk* c = CONTAINING_RECORD(le, chunk, list_entry);
+
+        c->changed = false;
+        c->space_changed = false;
+
+        le = le->Flink;
+    }
+
+    Vcb->superblock.generation++;
+
+    le = Vcb->trees.Flink;
+    while (le != &Vcb->trees) {
+        tree* t = CONTAINING_RECORD(le, tree, list_entry);
+
+        t->write = false;
+
+        le = le->Flink;
+    }
+
+    Vcb->need_write = false;
+
+    while (!IsListEmpty(&Vcb->drop_roots)) {
+        root* r = CONTAINING_RECORD(RemoveHeadList(&Vcb->drop_roots), root, list_entry);
+
+        if (IsListEmpty(&r->fcbs)) {
+            ExDeleteResourceLite(&r->nonpaged->load_tree_lock);
+            ExFreePool(r->nonpaged);
+            ExFreePool(r);
+        } else
+            r->dropped = true;
+    }
+}
+
 static void do_flush(device_extension* Vcb) {
+    pending_tree_writes ptw = {0};
+    write_superblocks_context* sb_ctx = NULL;
+    LIST_ENTRY rollback;
     NTSTATUS Status;
+    bool async = false;
+
+    TRACE("do_flush starting\n");
+
+    InitializeListHead(&rollback);
+
+    // =============================================================================
+    // Fase A: Preparación y lanzamiento de escrituras bajo tree_lock exclusivo.
+    // =============================================================================
+    //
+    // do_write2() ejecuta las siguientes sub-fases bajo tree_lock:
+    //   1. check_for_orphans()        - opera sobre extent_root (global)
+    //   2. flush dirty filerefs       - dirty_filerefs_lock + commit_batch_list
+    //   3. flush deleted fcbs         - dirty_fcbs_lock + commit_batch_list
+    //   4. flush remaining dirty fcbs - dirty_fcbs_lock + commit_batch_list
+    //   5. flush dirty subvols        - flush_subvol() por subvol
+    //   6. drop_roots()               - cross-subvolume
+    //   7. update_chunks()            - cross-subvolume (rebalance)
+    //   8. update_root_root() loop    - cache_changed loop (consistency)
+    //   9. write_trees()              - LANZA escrituras de nodos (sin esperar)
+    //  10. write_superblocks()        - LANZA escrituras de superbloques (sin esperar)
+    //
+    // Phase 3.2: Las escrituras de disco se lanzan pero NO se esperan dentro
+    // de tree_lock. Esto permite liberar el lock más temprano y continuar
+    // con I/O mientras esperamos.
+    //
+    // FUTURO: Cuando subvol_lock esté integrado en el I/O path, se podría
+    // reducir tree_lock a shared durante las fases 2-5 (flush de fcbs),
+    // manteniendo exclusivo solo para fases 6-10.
 
     ExAcquireResourceExclusiveLite(&Vcb->tree_lock, true);
 
-    if (Vcb->need_write && !Vcb->readonly)
-        Status = do_write(Vcb, NULL);
-    else
+    if (Vcb->need_write && !Vcb->readonly) {
+        Status = do_write2(Vcb, NULL, &rollback, &ptw, &sb_ctx);
+        async = (ptw.wtc != NULL || sb_ctx != NULL);
+    } else {
         Status = STATUS_SUCCESS;
+    }
+
+    ExReleaseResourceLite(&Vcb->tree_lock);
+
+    // =============================================================================
+    // Fase B: Espera de I/Os sin tree_lock (Phase 3.2 - async flush).
+    // =============================================================================
+    //
+    // Los I/Os de tree writes y superblock writes están en vuelo.
+    // Esperamos aquí sin tree_lock, permitiendo que otras operaciones de
+    // I/O (lecturas) se procesen mientras esperamos.
+    //
+    // El orden de espera importa:
+    // 1. Esperar tree writes (datos de árboles deben estar en disco primero)
+    // 2. Esperar superblock writes (commit point)
+    //
+    // NOTA: flush_disk_caches() ya se ejecutó en do_write2() después de
+    // tree writes (pero antes de lanzar superblock writes). El disco
+    // garantiza que los datos de árboles están persistentes antes del
+    // superblock.
+
+    if (async) {
+        // Wait for tree writes WITHOUT tree_lock
+        if (ptw.wtc) {
+            NTSTATUS ws = wait_tree_writes(Vcb, ptw.wtc, ptw.num_bits,
+                                            ptw.raid56, &ptw.tree_writes);
+            if (NT_SUCCESS(Status) && !NT_SUCCESS(ws)) {
+                ERR("wait_tree_writes returned %08lx\n", ws);
+                Status = ws;
+            }
+            ptw.wtc = NULL;
+        }
+
+        // Free tree write data (safe to do now that all I/Os completed)
+        while (!IsListEmpty(&ptw.tree_writes)) {
+            LIST_ENTRY* le = RemoveHeadList(&ptw.tree_writes);
+            tree_write* tw = CONTAINING_RECORD(le, tree_write, list_entry);
+            if (tw->data)
+                ExFreePool(tw->data);
+            ExFreePool(tw);
+        }
+
+        // Wait for superblock writes WITHOUT tree_lock
+        if (sb_ctx) {
+            NTSTATUS ws = wait_superblocks(Vcb, sb_ctx);
+            if (NT_SUCCESS(Status) && !NT_SUCCESS(ws)) {
+                ERR("wait_superblocks returned %08lx\n", ws);
+                Status = ws;
+            }
+            free_superblocks_context(sb_ctx);
+            sb_ctx = NULL;
+        }
+    }
+
+    // =============================================================================
+    // Fase C: Cleanup post-escritura bajo tree_lock.
+    // =============================================================================
+    //
+    // Después de que todos los I/Os completen:
+    // - Actualizar generaciones de children
+    // - Limpiar caches de espacio
+    // - Limpiar flags de chunks modificados
+    // - Incrementar generación del superbloque
+    // - Marcar trees como no-dirty
+    // - Marcar Vcb->need_write = false
+    // - Manejar drop_roots
+    //
+    // Se re-adquiere tree_lock porque estas operaciones modifican estado
+    // que otros threads (I/O path) podrían leer.
+
+    ExAcquireResourceExclusiveLite(&Vcb->tree_lock, true);
+
+    if (!NT_SUCCESS(Status)) {
+        // Error path (sync or async): mark readonly and rollback.
+        // In async mode, do_write2's end: label already waited for any
+        // in-flight I/Os. In sync mode, no I/Os are in flight.
+        Vcb->readonly = true;
+        FsRtlNotifyVolumeEvent(Vcb->root_file, FSRTL_VOLUME_FORCED_CLOSED);
+        do_rollback(Vcb, &rollback);
+    } else if (async) {
+        // Success + async: all I/Os completed, do post-write cleanup.
+        do_write2_end_cleanup(Vcb);
+        clear_rollback(&rollback);
+    } else {
+        // Success + sync: cleanup already done in do_write2.
+        clear_rollback(&rollback);
+    }
+
+    // Fase D: Liberación de estructuras de árboles en memoria.
+    //
+    // free_trees() itera Vcb->trees y libera nodos que ya no son necesarios.
+    // Necesita tree_lock exclusive porque itera Vcb->trees global y modifica
+    // r->treeholder.tree.
 
     free_trees(Vcb);
+
+    ExReleaseResourceLite(&Vcb->tree_lock);
 
     if (!NT_SUCCESS(Status))
         ERR("do_write returned %08lx\n", Status);
 
-    ExReleaseResourceLite(&Vcb->tree_lock);
+    TRACE("do_flush finished\n");
 }
 
 _Function_class_(KSTART_ROUTINE)

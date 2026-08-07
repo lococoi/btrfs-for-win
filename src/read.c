@@ -57,6 +57,36 @@ typedef struct {
     uint8_t* va;
 } read_data_context;
 
+// =============================================================================
+// Extent Prefetch Cache
+// Detects sequential read patterns and prefetches upcoming extent data into a
+// small in-memory cache. This helps when reads bypass the Windows Cache Manager
+// (IRP_NOCACHE path), where the OS readahead does not apply.
+// =============================================================================
+
+#define PREFETCH_MAX_ENTRIES 4
+#define PREFETCH_MAX_FCBS    32
+
+typedef struct {
+    uint64_t file_offset;   // File offset this entry covers
+    uint32_t file_size;     // Valid file data size
+    uint32_t disk_size;     // Aligned disk read size
+    uint32_t bumpoff;       // Alignment offset within disk buffer
+    uint8_t* data;          // Raw disk buffer (NonPagedPool)
+} prefetch_entry;
+
+typedef struct {
+    fcb*    fcb_ptr;        // Associated fcb (NULL = slot unused)
+    uint64_t last_read_end; // End offset of last successful read
+    uint32_t seq_count;     // Consecutive sequential reads counter
+    prefetch_entry entries[PREFETCH_MAX_ENTRIES];
+    uint32_t count;         // Number of valid entries
+} prefetch_state;
+
+static prefetch_state g_prefetch_cache[PREFETCH_MAX_FCBS];
+static FAST_MUTEX g_prefetch_mutex;
+static bool g_prefetch_inited = false;
+
 extern bool diskacc;
 extern tPsUpdateDiskCounters fPsUpdateDiskCounters;
 extern tCcCopyReadEx fCcCopyReadEx;
@@ -85,22 +115,33 @@ static NTSTATUS __stdcall read_data_completion(PDEVICE_OBJECT DeviceObject, PIRP
 }
 
 NTSTATUS check_csum(device_extension* Vcb, uint8_t* data, uint32_t sectors, void* csum) {
+    // Stack buffer for the common case (CRC32C/XXHASH with compressed extents).
+    // 256 bytes covers: CRC32C up to 64 sectors (256KB data), XXHASH up to 32 sectors (128KB data).
+    // Falls back to dynamic allocation for larger sizes (e.g. SHA256/BLAKE2 with many sectors).
+    uint8_t csum2_buf[256];
     void* csum2;
+    uint32_t csum_len = Vcb->csum_size * sectors;
 
-    csum2 = ExAllocatePoolWithTag(PagedPool, Vcb->csum_size * sectors, ALLOC_TAG);
-    if (!csum2) {
-        ERR("out of memory\n");
-        return STATUS_INSUFFICIENT_RESOURCES;
+    if (csum_len <= sizeof(csum2_buf)) {
+        csum2 = csum2_buf;
+    } else {
+        csum2 = ExAllocatePoolWithTag(PagedPool, csum_len, ALLOC_TAG);
+        if (!csum2) {
+            ERR("out of memory\n");
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
     }
 
     do_calc_job(Vcb, data, sectors, csum2);
 
-    if (RtlCompareMemory(csum2, csum, sectors * Vcb->csum_size) != sectors * Vcb->csum_size) {
-        ExFreePool(csum2);
+    if (RtlCompareMemory(csum2, csum, csum_len) != csum_len) {
+        if (csum2 != csum2_buf)
+            ExFreePool(csum2);
         return STATUS_CRC_ERROR;
     }
 
-    ExFreePool(csum2);
+    if (csum2 != csum2_buf)
+        ExFreePool(csum2);
 
     return STATUS_SUCCESS;
 }
@@ -2758,39 +2799,215 @@ NTSTATUS read_stream(fcb* fcb, uint8_t* data, uint64_t start, ULONG length, ULON
     return STATUS_SUCCESS;
 }
 
-typedef struct {
-    uint64_t off;
-    uint64_t ed_size;
-    uint64_t ed_offset;
-    uint64_t ed_num_bytes;
-} read_part_extent;
+// --- Prefetch cache helper functions ---
 
-typedef struct {
-    LIST_ENTRY list_entry;
-    uint64_t addr;
-    chunk* c;
-    uint32_t read;
-    uint32_t to_read;
-    void* csum;
-    bool csum_free;
-    uint8_t* buf;
-    bool buf_free;
-    uint32_t bumpoff;
-    bool mdl;
-    void* data;
-    uint8_t compression;
-    unsigned int num_extents;
-    read_part_extent extents[1];
-} read_part;
+static void prefetch_cache_init(void) {
+    if (!g_prefetch_inited) {
+        ExInitializeFastMutex(&g_prefetch_mutex);
+        RtlZeroMemory(g_prefetch_cache, sizeof(g_prefetch_cache));
+        g_prefetch_inited = true;
+    }
+}
 
-typedef struct {
-    LIST_ENTRY list_entry;
-    calc_job* cj;
-    void* decomp;
-    void* data;
-    unsigned int offset;
-    size_t length;
-} comp_calc_job;
+static prefetch_state* prefetch_cache_find(fcb* fcb) {
+    prefetch_state* oldest = NULL;
+    uint32_t oldest_seq = UINT32_MAX;
+
+    for (int i = 0; i < PREFETCH_MAX_FCBS; i++) {
+        if (g_prefetch_cache[i].fcb_ptr == fcb)
+            return &g_prefetch_cache[i];
+        if (g_prefetch_cache[i].fcb_ptr == NULL) {
+            g_prefetch_cache[i].fcb_ptr = fcb;
+            return &g_prefetch_cache[i];
+        }
+        if (g_prefetch_cache[i].seq_count < oldest_seq) {
+            oldest_seq = g_prefetch_cache[i].seq_count;
+            oldest = &g_prefetch_cache[i];
+        }
+    }
+
+    // All slots full — evict the one with the lowest sequential count
+    if (oldest) {
+        for (int j = 0; j < PREFETCH_MAX_ENTRIES; j++) {
+            if (oldest->entries[j].data) {
+                ExFreePool(oldest->entries[j].data);
+                oldest->entries[j].data = NULL;
+            }
+        }
+        oldest->fcb_ptr = fcb;
+        oldest->last_read_end = 0;
+        oldest->seq_count = 0;
+        oldest->count = 0;
+    }
+    return oldest;
+}
+
+static void prefetch_cache_clear(prefetch_state* state) {
+    for (uint32_t i = 0; i < PREFETCH_MAX_ENTRIES; i++) {
+        if (state->entries[i].data) {
+            ExFreePool(state->entries[i].data);
+            state->entries[i].data = NULL;
+        }
+    }
+    state->count = 0;
+}
+
+// Try to serve [start, start+len) from the prefetch cache.
+// Returns the number of bytes served (may be < len on partial/miss).
+static uint32_t prefetch_cache_read(fcb* fcb, uint64_t start, uint32_t len, uint8_t* dest) {
+    prefetch_state* state;
+    uint32_t served = 0;
+
+    ExAcquireFastMutex(&g_prefetch_mutex);
+
+    state = prefetch_cache_find(fcb);
+    if (!state || state->count == 0) {
+        ExReleaseFastMutex(&g_prefetch_mutex);
+        return 0;
+    }
+
+    // Walk cache entries and copy overlapping regions
+    uint64_t range_end = start + (uint64_t)len;
+
+    for (uint32_t i = 0; i < state->count && served < len; i++) {
+        prefetch_entry* e = &state->entries[i];
+        if (!e->data) continue;
+
+        uint64_t e_start = e->file_offset;
+        uint64_t e_end   = e_start + e->file_size;
+
+        if (start < e_end && range_end > e_start) {
+            uint64_t copy_start = max(start, e_start);
+            uint64_t copy_end   = min(range_end, e_end);
+            uint32_t dest_off   = (uint32_t)(copy_start - start);
+            uint32_t src_off    = (uint32_t)(copy_start - e_start) + e->bumpoff;
+            uint32_t copy_size  = (uint32_t)(copy_end - copy_start);
+
+            RtlCopyMemory(dest + dest_off, e->data + src_off, copy_size);
+            served += copy_size;
+        }
+    }
+
+    ExReleaseFastMutex(&g_prefetch_mutex);
+    return served;
+}
+
+// Prefetch upcoming extents after a successful sequential read.
+// Called at the end of read_file() on the success path.
+static void prefetch_upcoming_extents(fcb* fcb, uint64_t read_end) {
+    prefetch_state* state;
+    LIST_ENTRY* le;
+    uint32_t count = 0;
+
+    ExAcquireFastMutex(&g_prefetch_mutex);
+
+    state = prefetch_cache_find(fcb);
+    if (!state) {
+        ExReleaseFastMutex(&g_prefetch_mutex);
+        return;
+    }
+
+    // Detect sequential access: read_end should be >= last_read_end and within 1 MB
+    if (state->last_read_end > 0 &&
+        read_end >= state->last_read_end &&
+        read_end - state->last_read_end <= 1024 * 1024) {
+        state->seq_count++;
+    } else {
+        state->seq_count = 1;
+        prefetch_cache_clear(state);
+    }
+    state->last_read_end = read_end;
+
+    // Only prefetch after we've confirmed sequential pattern (2+ reads)
+    if (state->seq_count < 2) {
+        ExReleaseFastMutex(&g_prefetch_mutex);
+        return;
+    }
+
+    // Find the extent that covers or follows read_end
+    le = fcb->extents.Flink;
+    while (le != &fcb->extents) {
+        extent* ext = CONTAINING_RECORD(le, extent, list_entry);
+
+        if (!ext->ignore) {
+            EXTENT_DATA* ed = &ext->extent_data;
+            uint64_t len;
+
+            if (ed->type == EXTENT_TYPE_REGULAR || ed->type == EXTENT_TYPE_PREALLOC)
+                len = ((EXTENT_DATA2*)ed->data)->num_bytes;
+            else
+                len = ed->decoded_size;
+
+            if (ext->offset + len > read_end)
+                break;
+        }
+
+        le = le->Flink;
+    }
+
+    // Clear stale prefetch entries
+    prefetch_cache_clear(state);
+
+    // Prefetch up to PREFETCH_MAX_ENTRIES upcoming REGULAR non-compressed extents
+    while (le != &fcb->extents && count < PREFETCH_MAX_ENTRIES) {
+        extent* ext = CONTAINING_RECORD(le, extent, list_entry);
+
+        if (!ext->ignore && ext->extent_data.type == EXTENT_TYPE_REGULAR) {
+            EXTENT_DATA* ed = &ext->extent_data;
+
+            if (ed->compression == BTRFS_COMPRESSION_NONE) {
+                EXTENT_DATA2* ed2 = (EXTENT_DATA2*)ed->data;
+                chunk* c;
+                uint64_t addr;
+                uint32_t file_size, to_read, bumpoff = 0;
+                uint8_t* buf;
+                NTSTATUS Status;
+
+                file_size = (uint32_t)ed2->num_bytes;
+                if (file_size == 0) goto next_prefetch;
+
+                addr = ed2->address + ed2->offset;
+                to_read = (uint32_t)sector_align(file_size, fcb->Vcb->superblock.sector_size);
+
+                if (addr & (fcb->Vcb->superblock.sector_size - 1)) {
+                    bumpoff = (uint32_t)(addr & (fcb->Vcb->superblock.sector_size - 1));
+                    addr -= bumpoff;
+                    to_read = (uint32_t)sector_align(file_size + bumpoff,
+                                                      fcb->Vcb->superblock.sector_size);
+                }
+
+                buf = ExAllocatePoolWithTag(NonPagedPool, to_read, ALLOC_TAG);
+                if (!buf) goto next_prefetch;
+
+                c = get_chunk_from_address(fcb->Vcb, addr);
+                if (!c) {
+                    ExFreePool(buf);
+                    goto next_prefetch;
+                }
+
+                Status = read_data(fcb->Vcb, addr, to_read, NULL, false, buf, c, NULL,
+                                   NULL, 0, true, LowPagePriority);
+                if (NT_SUCCESS(Status)) {
+                    state->entries[count].file_offset = ext->offset;
+                    state->entries[count].file_size   = file_size;
+                    state->entries[count].disk_size   = to_read;
+                    state->entries[count].bumpoff     = bumpoff;
+                    state->entries[count].data        = buf;
+                    count++;
+                } else {
+                    ExFreePool(buf);
+                }
+            }
+        }
+
+    next_prefetch:
+        le = le->Flink;
+    }
+
+    state->count = count;
+
+    ExReleaseFastMutex(&g_prefetch_mutex);
+}
 
 __attribute__((nonnull(1, 2)))
 NTSTATUS read_file(fcb* fcb, uint8_t* data, uint64_t start, uint64_t length, ULONG* pbr, PIRP Irp) {
@@ -2813,6 +3030,20 @@ NTSTATUS read_file(fcb* fcb, uint8_t* data, uint64_t start, uint64_t length, ULO
 
     InitializeListHead(&read_parts);
     InitializeListHead(&calc_jobs);
+
+    // --- Prefetch cache fast path ---
+    // If the requested range is fully covered by prefetched data, serve it
+    // directly and skip the normal extent iteration + read_data path.
+    prefetch_cache_init();
+    {
+        uint32_t cached = prefetch_cache_read(fcb, start, (uint32_t)length, data);
+        if (cached >= (uint32_t)length) {
+            bytes_read = (uint32_t)length;
+            Status = STATUS_SUCCESS;
+            if (pbr) *pbr = bytes_read;
+            goto exit;
+        }
+    }
 
     pool_type = fcb->Header.Flags2 & FSRTL_FLAG2_IS_PAGING_FILE ? NonPagedPool : PagedPool;
 
@@ -2884,7 +3115,11 @@ NTSTATUS read_file(fcb* fcb, uint8_t* data, uint64_t start, uint64_t length, ULO
                         read = (uint32_t)min(ed->decoded_size - off, length);
 
                         if (off > 0) {
-                            decomp = ExAllocatePoolWithTag(NonPagedPool, (uint32_t)ed->decoded_size, ALLOC_TAG);
+                            /* Allocate only the bytes we actually need to decompress (off + read),
+                             * not the full ed->decoded_size. Decompression APIs (zlib, lzo, zstd)
+                             * don't support an output offset, so we must decompress from the start
+                             * of the stream and then copy the portion we need. */
+                            decomp = ExAllocatePoolWithTag(NonPagedPool, (uint32_t)(read + off), ALLOC_TAG);
                             if (!decomp) {
                                 ERR("out of memory\n");
                                 Status = STATUS_INSUFFICIENT_RESOURCES;
@@ -2949,7 +3184,7 @@ NTSTATUS read_file(fcb* fcb, uint8_t* data, uint64_t start, uint64_t length, ULO
                     EXTENT_DATA2* ed2 = (EXTENT_DATA2*)ed->data;
                     read_part* rp;
 
-                    rp = ExAllocatePoolWithTag(pool_type, sizeof(read_part), ALLOC_TAG);
+                    rp = (read_part*)ExAllocateFromNPagedLookasideList(&fcb->Vcb->read_part_lookaside);
                     if (!rp) {
                         ERR("out of memory\n");
                         Status = STATUS_INSUFFICIENT_RESOURCES;
@@ -2990,7 +3225,7 @@ NTSTATUS read_file(fcb* fcb, uint8_t* data, uint64_t start, uint64_t length, ULO
                         if (!rp->buf) {
                             ERR("out of memory\n");
                             Status = STATUS_INSUFFICIENT_RESOURCES;
-                            ExFreePool(rp);
+                            ExFreeToNPagedLookasideList(&fcb->Vcb->read_part_lookaside, rp);
                             goto exit;
                         }
 
@@ -3005,7 +3240,7 @@ NTSTATUS read_file(fcb* fcb, uint8_t* data, uint64_t start, uint64_t length, ULO
                         if (rp->buf_free)
                             ExFreePool(rp->buf);
 
-                        ExFreePool(rp);
+                        ExFreeToNPagedLookasideList(&fcb->Vcb->read_part_lookaside, rp);
 
                         Status = STATUS_INTERNAL_ERROR;
                         goto exit;
@@ -3136,7 +3371,7 @@ nextitem:
 
                 RemoveEntryList(&rp->list_entry);
 
-                ExFreePool(rp);
+                ExFreeToNPagedLookasideList(&fcb->Vcb->read_part_lookaside, rp);
 
                 if (last_rp->buf_free)
                     ExFreePool(last_rp->buf);
@@ -3146,7 +3381,10 @@ nextitem:
 
                 RemoveEntryList(&last_rp->list_entry);
 
-                ExFreePool(last_rp);
+                if (last_rp->num_extents > 1)
+                    ExFreePool(last_rp);
+                else
+                    ExFreeToNPagedLookasideList(&fcb->Vcb->read_part_lookaside, last_rp);
 
                 last_rp = rp2;
             } else
@@ -3212,9 +3450,21 @@ nextitem:
                     inpageoff = inoff % LZO_PAGE_SIZE;
                 }
 
-                /* Previous versions of this code decompressed directly into the destination buffer,
-                 * but unfortunately that can't be relied on - Windows likes to use dummy pages sometimes
-                 * when mmap-ing, which breaks the backtracking used by e.g. zstd. */
+                /* Decompress to a temporary buffer instead of directly into the destination.
+                 *
+                 * Two reasons the intermediate buffer is required:
+                 *
+                 * 1. Windows can substitute dummy/zeroed pages for mmap'd memory regions
+                 *    (demand-zero pages), which breaks decompressors like zstd that need
+                 *    to read previously-written output for backtracking/referencing.
+                 *
+                 * 2. Each comp_calc_job may write to a non-overlapping region of the
+                 *    destination buffer, but decompression APIs (zlib, lzo, zstd) always
+                 *    start output at byte 0 of the provided buffer, so an intermediate
+                 *    buffer is needed to handle the off2 offset.
+                 *
+                 * The RtlCopyMemory after job completion (below) is therefore unavoidable
+                 * and cannot be safely eliminated. */
 
                 if (off2 != 0)
                     outlen = off2 + min(rp->read, (uint32_t)(rp->extents[i].ed_num_bytes - rp->extents[i].off));
@@ -3228,7 +3478,7 @@ nextitem:
                     goto exit;
                 }
 
-                ccj = (comp_calc_job*)ExAllocatePoolWithTag(pool_type, sizeof(comp_calc_job), ALLOC_TAG);
+                ccj = (comp_calc_job*)ExAllocateFromNPagedLookasideList(&fcb->Vcb->comp_calc_job_lookaside);
                 if (!ccj) {
                     ERR("out of memory\n");
 
@@ -3250,7 +3500,7 @@ nextitem:
                     ERR("add_calc_job_decomp returned %08lx\n", Status);
 
                     ExFreePool(decomp);
-                    ExFreePool(ccj);
+                    ExFreeToNPagedLookasideList(&fcb->Vcb->comp_calc_job_lookaside, ccj);
 
                     goto exit;
                 }
@@ -3277,21 +3527,33 @@ nextitem:
 
     Status = STATUS_SUCCESS;
 
+    // Decompression jobs were already dispatched to the calc thread pool
+    // by add_calc_job_decomp() — pool threads process them in parallel.
+    // Just wait for each job's completion event.
+    // Fallback: if no pool threads exist, execute on the calling thread.
     while (!IsListEmpty(&calc_jobs)) {
-        comp_calc_job* ccj = CONTAINING_RECORD(RemoveTailList(&calc_jobs), comp_calc_job, list_entry);
+        comp_calc_job* ccj = CONTAINING_RECORD(RemoveHeadList(&calc_jobs), comp_calc_job, list_entry);
 
-        calc_thread_main(fcb->Vcb, ccj->cj);
+        if (fcb->Vcb->calcthreads.num_threads == 0)
+            calc_thread_main(fcb->Vcb, ccj->cj);
 
         KeWaitForSingleObject(&ccj->cj->event, Executive, KernelMode, false, NULL);
 
         if (!NT_SUCCESS(ccj->cj->Status))
             Status = ccj->cj->Status;
 
+        /* Copy from temporary decomp buffer to final destination.
+         * This copy is necessary - see the comment above (line ~3230) explaining why
+         * decompression cannot target the destination buffer directly. */
         RtlCopyMemory(ccj->data, (uint8_t*)ccj->decomp + ccj->offset, ccj->length);
         ExFreePool(ccj->decomp);
 
-        ExFreePool(ccj);
+        ExFreeToNPagedLookasideList(&fcb->Vcb->comp_calc_job_lookaside, ccj);
     }
+
+    // --- Prefetch upcoming extents for sequential access ---
+    if (NT_SUCCESS(Status) && bytes_read > 0)
+        prefetch_upcoming_extents(fcb, start + bytes_read);
 
     if (pbr)
         *pbr = bytes_read;
@@ -3306,7 +3568,10 @@ exit:
         if (rp->csum_free)
             ExFreePool(rp->csum);
 
-        ExFreePool(rp);
+        if (rp->num_extents > 1)
+            ExFreePool(rp);
+        else
+            ExFreeToNPagedLookasideList(&fcb->Vcb->read_part_lookaside, rp);
     }
 
     while (!IsListEmpty(&calc_jobs)) {
@@ -3319,7 +3584,7 @@ exit:
 
         ExFreePool(ccj->cj);
 
-        ExFreePool(ccj);
+        ExFreeToNPagedLookasideList(&fcb->Vcb->comp_calc_job_lookaside, ccj);
     }
 
     return Status;
@@ -3513,7 +3778,7 @@ NTSTATUS __stdcall drv_read(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     bool top_level;
     fcb* fcb;
     ccb* ccb;
-    bool acquired_fcb_lock = false, wait;
+    bool acquired_fcb_lock = false, acquired_subvol_lock = false, wait;
 
     FsRtlEnterFileSystem();
 
@@ -3582,21 +3847,30 @@ NTSTATUS __stdcall drv_read(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     if (Irp->Flags & IRP_PAGING_IO)
         wait = true;
 
-    if (!(Irp->Flags & IRP_PAGING_IO) && FileObject->SectionObjectPointer && FileObject->SectionObjectPointer->DataSectionObject) {
-        IO_STATUS_BLOCK iosb;
+    // REMOVED: CcFlushCache before read was unnecessary and hurt mixed read/write performance.
+    // The Windows Cache Manager handles coherency correctly without this synchronous flush.
 
-        CcFlushCache(FileObject->SectionObjectPointer, &IrpSp->Parameters.Read.ByteOffset, IrpSp->Parameters.Read.Length, &iosb);
-        if (!NT_SUCCESS(iosb.Status)) {
-            ERR("CcFlushCache returned %08lx\n", iosb.Status);
-            Status = iosb.Status;
+    // Acquire subvol_lock shared to allow parallel reads across different subvolumes.
+    // Lock hierarchy: subvol_lock -> fcb->Header.Resource (tree_lock is NOT held here).
+    // Only acquire if fcb has a valid subvol (volume_fcb case already handled above).
+    if (fcb->subvol) {
+        if (!ExAcquireResourceSharedLite(&fcb->subvol->subvol_lock, wait)) {
+            Status = STATUS_PENDING;
+            IoMarkIrpPending(Irp);
             goto exit;
         }
+
+        acquired_subvol_lock = true;
     }
 
     if (!ExIsResourceAcquiredSharedLite(fcb->Header.Resource)) {
         if (!ExAcquireResourceSharedLite(fcb->Header.Resource, wait)) {
             Status = STATUS_PENDING;
             IoMarkIrpPending(Irp);
+
+            if (acquired_subvol_lock)
+                ExReleaseResourceLite(&fcb->subvol->subvol_lock);
+
             goto exit;
         }
 
@@ -3607,6 +3881,9 @@ NTSTATUS __stdcall drv_read(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
     if (acquired_fcb_lock)
         ExReleaseResourceLite(fcb->Header.Resource);
+
+    if (acquired_subvol_lock)
+        ExReleaseResourceLite(&fcb->subvol->subvol_lock);
 
 exit:
     if (FileObject->Flags & FO_SYNCHRONOUS_IO && !(Irp->Flags & IRP_PAGING_IO))
