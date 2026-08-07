@@ -23,6 +23,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       # Required by the user: run on a Node.js runtime > 24.
       - name: Set up Node.js (>= 26)
