@@ -86,27 +86,34 @@ Todo
 Installation
 ------------
 
-To install the driver, [download and extract the latest release](https://github.com/maharmstone/btrfs/releases),
-right-click btrfs.inf, and choose Install. The driver is signed, so should work out
-of the box on modern versions of Windows.
+To install the driver, [download and extract the latest release](https://github.com/lococoi/btrfs-for-win/releases),
+right-click btrfs.inf, and choose Install.
 
-If you using Windows 10 or 11 and have Secure Boot enabled, you may have to make a Registry
-change in order for the driver to be loaded - see [below](#secureboot). It's easier though
-just to turn off Secure Boot in your BIOS, unless you have a particular need for it. Bear in
-mind that Windows 11 soft-requires Secure Boot to be installed, but will work fine afterwords
-with it turned off.
+The builds produced by this fork's CI are **not digitally signed** (no code-signing certificate
+is configured), so on modern Windows you must allow unsigned kernel drivers to load first:
 
-WinBtrfs is also available on the following package managers:
+* Disable **Secure Boot** in your BIOS/UEFI, or
+* Enable **test signing** from an elevated command prompt and reboot:
+  ```
+  bcdedit /set testsigning on
+  ```
 
-* [Chocolatey](https://chocolatey.org/packages/winbtrfs)
-```
-choco install winbtrfs
-```
-* [Scoop](https://scoop.sh/#/apps?q=%22winbtrfs-np%22&s=0&d=1&o=true)
-```
-scoop bucket add nonportable
-scoop install winbtrfs-np -g
-```
+If you are using Windows 10 or 11 with Secure Boot enabled, you may also have to make a Registry
+change in order for the driver to be loaded - see [below](#secureboot). Bear in mind that
+Windows 11 soft-requires Secure Boot, but will work fine with it turned off.
+
+> The upstream WinBtrfs is also available through the following package managers, but note that
+> these install the **original** driver (from maharmstone/btrfs), not this fork's builds:
+>
+> * [Chocolatey](https://chocolatey.org/packages/winbtrfs)
+>   ```
+>   choco install winbtrfs
+>   ```
+> * [Scoop](https://scoop.sh/#/apps?q=%22winbtrfs-np%22&s=0&d=1&o=true)
+>   ```
+>   scoop bucket add nonportable
+>   scoop install winbtrfs-np -g
+>   ```
 
 Uninstalling
 ------------
