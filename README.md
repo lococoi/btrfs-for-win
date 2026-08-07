@@ -1,5 +1,6 @@
-WinBtrfs v1.9
+WinBtrfs v2.0
 -------------
+
 
 WinBtrfs is a Windows driver for the next-generation Linux filesystem Btrfs.
 A reimplementation from scratch, it contains no code from the Linux kernel,
@@ -295,6 +296,23 @@ Windows ACL on files that you don't want to be able to edit.
 
 Changelog
 ---------
+
+v2.0 (2026-08-07) — Performance-optimised fork:
+* Removed the synchronous CcFlushCache from cached read paths
+* Replaced per-call allocation in checksum verification with a stack buffer
+* Added an O(1) hash table for chunk lookups
+* Parallelised tree checksum computation
+* Switched extent decompression scheduling from LIFO to FIFO
+* Added a binary-search index to B-tree nodes
+* Added a real parallel decompression pipeline
+* Pooled read/compress/write buffers with NPAGED lookaside lists
+* Introduced per-subvolume locking with hierarchical locking in do_flush
+* Added asynchronous flush with launch/wait split for tree writes and superblocks
+* Added sequential extent prefetch (32-slot cache) and sibling-node prefetch
+* Added adaptive, balanced B-tree splitting
+* Upgraded bundled zstd and zlib submodules
+* Added GitHub Actions CI (builds on windows-latest with MSVC + WDK)
+* Added LICENSE (LGPL-3.0) and .gitignore
 
 v1.9 (2024-03-15):
 * Added support for block group tree (Linux 6.1)
