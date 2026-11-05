@@ -74,7 +74,7 @@ jobs:
           shopt -s nullglob
           mkdir -p dist
 
-          for arch in amd64 x86; do
+          for arch in amd64; do
             src="artifacts/btrfs-$arch"
             if [[ ! -d "$src" ]]; then
               echo "::error::missing artifact btrfs-$arch"
@@ -104,7 +104,7 @@ jobs:
         run: |
           set -euo pipefail
           cat > notes.md <<'EOF'
-          Unsigned builds for **Windows 10 and 11** (x86, x64).
+          Unsigned builds for **Windows 10 and 11** (x64).
 
           Packages: `btrfs.sys`, `btrfs.inf`, `btrfs-vol.inf`, `shellbtrfs.dll`,
           `ubtrfs.dll`, `mkbtrfs.exe` and the matching `.pdb` files.

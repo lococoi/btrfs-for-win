@@ -19,17 +19,9 @@ Btrfs.DriverFiles       = 12            ;%windir%\system32\drivers
 
 [Manufacturer]
 ; .10.0 = Windows 10 and above
-%Me%=Standard,NTamd64.10.0,NTx86.10.0,NTarm64.10.0
+%Me%=Standard,NTamd64.10.0
 
 [Standard.NTamd64.10.0]
-%VolumeName% = Btrfs_Install, BtrfsVolume
-%ControllerName% = Btrfs_Install, ROOT\btrfs
-
-[Standard.NTx86.10.0]
-%VolumeName% = Btrfs_Install, BtrfsVolume
-%ControllerName% = Btrfs_Install, ROOT\btrfs
-
-[Standard.NTarm64.10.0]
 %VolumeName% = Btrfs_Install, BtrfsVolume
 %ControllerName% = Btrfs_Install, ROOT\btrfs
 
@@ -63,14 +55,8 @@ LoadOrderGroup   = "File System"
 [SourceDisksFiles]
 btrfs.sys = 1,,
 
-[SourceDisksNames.x86]
-1 = %DiskId1%,,,\x86
-
 [SourceDisksNames.amd64]
 1 = %DiskId1%,,,\amd64
-
-[SourceDisksNames.arm64]
-1 = %DiskId1%,,,\aarch64
 
 ;;
 ;; String Section

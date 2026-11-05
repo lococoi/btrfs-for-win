@@ -5,7 +5,7 @@ WinBtrfs v2.0
 WinBtrfs is a Windows driver for the next-generation Linux filesystem Btrfs.
 A reimplementation from scratch, it contains no code from the Linux kernel.
 
-This fork supports Windows 10 and Windows 11 only (x86, x64 and ARM64). The
+This fork supports Windows 10 and Windows 11 only, and only on x64. The
 support for older versions of Windows that upstream carries - XP, Server 2003,
 Vista, 7, 8, and 32-bit ARM - has been removed: those code paths are gone, the
 INF files require Windows 10, and the driver is built against the Win10 RS5
@@ -150,11 +150,16 @@ generate your Makefile.
 CI and releases
 ---------------
 
-`.github/workflows/ci.yml` builds x86 and x64 on every push to `master` and on every pull
-request (installing the WDK first, as `windows-latest` no longer ships it) and uploads the
-binaries as artifacts. `.github/workflows/cd.yml` is the publishing half: push a `v*` tag
-and it runs the same CI build, stamps the tag into `DriverVer`, zips the packages and
-attaches them to a GitHub release with a `SHA256SUMS.txt`.
+`.github/workflows/ci.yml` builds x64 on every push to `master` and on every pull request
+(installing the WDK first, as `windows-latest` no longer ships it) and uploads the binaries
+as artifacts. `.github/workflows/cd.yml` is the publishing half: push a `v*` tag and it runs
+the same CI build, stamps the tag into `DriverVer`, zips the package and attaches it to a
+GitHub release with a `SHA256SUMS.txt`.
+
+x86 and ARM64 are not built any more: starting with the Windows 11 24H2 WDK
+(10.0.26100) x86 kernel-mode drivers can't be compiled at all (only WDK 23H2 or older
+can), and Windows 11 has no 32-bit edition. If you need a 32-bit driver, build it against
+an older WDK; the CMake files still have the `/Gz` and `msvc-x86.cmake` bits for that.
 
 Mappings
 --------

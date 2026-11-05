@@ -22,7 +22,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, x86]
+        # x86 is not built: starting with the Windows 11 24H2 WDK (10.0.26100) there
+        # are no x86 kernel libs anymore, only WDK 23H2 and older can build them.
+        arch: [amd64]
 
     steps:
       - name: Checkout
@@ -48,13 +50,15 @@ jobs:
           }
 
       # windows-latest (2025) no longer ships the Windows Driver Kit, so the km
-      # headers and the per-arch kernel libs have to be installed.
+      # headers and the kernel libs for the target arch have to be installed.
       - name: Install Windows Driver Kit
         shell: pwsh
         run: |
           # NOTE: "${env:ProgramFiles(x86)}" needs the braces. "$env:ProgramFiles(x86)"
           # silently expands to "C:\Program Files(x86)" - no space - so every path below
           # it matches nothing.
+          $msarch = if ("${{ matrix.arch }}" -eq "x86") { "x86" } else { "x64" }
+
           function Get-KitsRoot {
             foreach ($key in @('HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots',
                                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots')) {
@@ -69,28 +73,34 @@ jobs:
               Where-Object { Test-Path (Join-Path $_.FullName 'km\ntifs.h') }
           }
 
+          function Get-WdkArchLib([string]$root) {
+            Get-ChildItem (Join-Path $root 'Lib') -Directory -ErrorAction SilentlyContinue |
+              Where-Object { Test-Path (Join-Path $_.FullName "km\$msarch\ntoskrnl.lib") }
+          }
+
           $root = Get-KitsRoot
           echo "Windows Kits root: $root"
 
-          $have = Get-WdkInclude $root
-          if ($have) {
-            echo "WDK already present: $($have.FullName -join ', ')"
+          if ((Get-WdkInclude $root) -and (Get-WdkArchLib $root)) {
+            echo "WDK already present with km\$msarch libs"
             exit 0
           }
 
           echo "WDK not found, installing via winget..."
           winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --silent `
             --accept-package-agreements --accept-source-agreements --disable-interactivity
-          # winget returns non-zero for "already installed"; the check below is what
-          # decides whether the install actually worked.
+          # winget returns non-zero for "already installed"; the check below decides.
+
           $root = Get-KitsRoot
-          $have = Get-WdkInclude $root
-          if (-not $have) {
-            $seen = Get-ChildItem (Join-Path $root 'Include') -Directory -ErrorAction SilentlyContinue |
+          $inc = Get-WdkInclude $root
+          $lib = Get-WdkArchLib $root
+          if (-not $inc -or -not $lib) {
+            $seen = Get-ChildItem (Join-Path $root 'Lib') -Directory -ErrorAction SilentlyContinue |
                       ForEach-Object { $_.FullName }
-            throw "WDK installation failed: no Include\*\km\ntifs.h under '$root'. Include dirs seen: $($seen -join ', ')"
+            throw ("WDK incomplete under '$root' (km\ntifs.h: $([bool]$inc), " +
+                   "km\$msarch\ntoskrnl.lib: $([bool]$lib)). Lib dirs seen: $($seen -join ', ').")
           }
-          echo "WDK installed: $($have.FullName -join ', ')"
+          echo "WDK installed: $($inc.FullName -join ', ') with km\$msarch libs"
 
       - name: Verify WDK kernel libs (${{ matrix.arch }})
         shell: pwsh
