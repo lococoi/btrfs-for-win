@@ -21,11 +21,6 @@
 #include <ntddstor.h>
 
 extern PDEVICE_OBJECT master_devobj;
-extern tFsRtlGetEcpListFromIrp fFsRtlGetEcpListFromIrp;
-extern tFsRtlGetNextExtraCreateParameter fFsRtlGetNextExtraCreateParameter;
-extern tFsRtlValidateReparsePointBuffer fFsRtlValidateReparsePointBuffer;
-extern tFsRtlCurrentOplockH fFsRtlCurrentOplockH;
-extern tFsRtlOplockBreakH fFsRtlOplockBreakH;
 
 static const WCHAR datastring[] = L"::$DATA";
 
@@ -3096,14 +3091,14 @@ static NTSTATUS file_create(PIRP Irp, _Requires_lock_held_(_Curr_->tree_lock) _R
         return STATUS_CANNOT_DELETE;
     }
 
-    if (fFsRtlGetEcpListFromIrp && fFsRtlGetNextExtraCreateParameter) {
-        if (NT_SUCCESS(fFsRtlGetEcpListFromIrp(Irp, &ecp_list)) && ecp_list) {
+    {
+        if (NT_SUCCESS(FsRtlGetEcpListFromIrp(Irp, &ecp_list)) && ecp_list) {
             void* ctx = NULL;
             GUID type;
             ULONG ctxsize;
 
             do {
-                Status = fFsRtlGetNextExtraCreateParameter(ecp_list, ctx, &type, &ctx, &ctxsize);
+                Status = FsRtlGetNextExtraCreateParameter(ecp_list, ctx, &type, &ctx, &ctxsize);
 
                 if (NT_SUCCESS(Status)) {
                     if (RtlCompareMemory(&type, &GUID_ECP_ATOMIC_CREATE, sizeof(GUID)) == sizeof(GUID)) {
@@ -3453,7 +3448,6 @@ static __inline void debug_create_options(ULONG RequestedOptions) {
             options &= ~FILE_NO_COMPRESSION;
         }
 
-#if NTDDI_VERSION >= NTDDI_WIN7
         if (options & FILE_OPEN_REQUIRING_OPLOCK) {
             TRACE("    FILE_OPEN_REQUIRING_OPLOCK\n");
             options &= ~FILE_OPEN_REQUIRING_OPLOCK;
@@ -3463,7 +3457,6 @@ static __inline void debug_create_options(ULONG RequestedOptions) {
             TRACE("    FILE_DISALLOW_EXCLUSIVE\n");
             options &= ~FILE_DISALLOW_EXCLUSIVE;
         }
-#endif
 
         if (options & FILE_RESERVE_OPFILTER) {
             TRACE("    FILE_RESERVE_OPFILTER\n");
@@ -3579,7 +3572,7 @@ static NTSTATUS get_reparse_block(fcb* fcb, uint8_t** data) {
 
             *data = (uint8_t*)rdb;
         } else {
-            Status = fFsRtlValidateReparsePointBuffer(bytes_read, (REPARSE_DATA_BUFFER*)*data);
+            Status = FsRtlValidateReparsePointBuffer(bytes_read, (REPARSE_DATA_BUFFER*)*data);
             if (!NT_SUCCESS(Status)) {
                 ERR("FsRtlValidateReparsePointBuffer returned %08lx\n", Status);
                 ExFreePool(*data);
@@ -3595,7 +3588,7 @@ static NTSTATUS get_reparse_block(fcb* fcb, uint8_t** data) {
             return STATUS_INTERNAL_ERROR;
         }
 
-        Status = fFsRtlValidateReparsePointBuffer(fcb->reparse_xattr.Length, (REPARSE_DATA_BUFFER*)fcb->reparse_xattr.Buffer);
+        Status = FsRtlValidateReparsePointBuffer(fcb->reparse_xattr.Length, (REPARSE_DATA_BUFFER*)fcb->reparse_xattr.Buffer);
         if (!NT_SUCCESS(Status)) {
             ERR("FsRtlValidateReparsePointBuffer returned %08lx\n", Status);
             return Status;
@@ -4190,8 +4183,8 @@ static NTSTATUS open_file2(device_extension* Vcb, ULONG RequestedDisposition, fi
             is_batch_oplock = FsRtlCurrentBatchOplock(fcb_oplock(fileref->fcb));
 
             if (!is_batch_oplock) {
-                if (fFsRtlCurrentOplockH && !(IrpSp->Parameters.Create.Options & FILE_COMPLETE_IF_OPLOCKED))
-                    is_handle_oplock = fFsRtlCurrentOplockH(fcb_oplock(fileref->fcb));
+                if (!(IrpSp->Parameters.Create.Options & FILE_COMPLETE_IF_OPLOCKED))
+                    is_handle_oplock = FsRtlCurrentOplockH(fcb_oplock(fileref->fcb));
 
                 if (!is_handle_oplock) {
                     TRACE("IoCheckShareAccess failed, returned %08lx\n", Status);
@@ -4213,7 +4206,7 @@ static NTSTATUS open_file2(device_extension* Vcb, ULONG RequestedDisposition, fi
         KeInitializeEvent(&ctx->event, NotificationEvent, false);
 
         if (is_handle_oplock) {
-            Status = fFsRtlOplockBreakH(fcb_oplock(fileref->fcb), Irp, 0, ctx,
+            Status = FsRtlOplockBreakH(fcb_oplock(fileref->fcb), Irp, 0, ctx,
                                         oplock_complete, NULL);
         } else {
             if (is_batch_oplock)

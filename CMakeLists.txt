@@ -9,8 +9,6 @@ if(MSVC) # cmake bug 15170
         set(CMAKE_SYSTEM_PROCESSOR "x86")
     elseif(MSVC_C_ARCHITECTURE_ID STREQUAL "x64")
         set(CMAKE_SYSTEM_PROCESSOR "x86_64")
-    elseif(MSVC_C_ARCHITECTURE_ID STREQUAL "ARMV7")
-        set(CMAKE_SYSTEM_PROCESSOR "arm")
     elseif(MSVC_C_ARCHITECTURE_ID STREQUAL "ARM64")
         set(CMAKE_SYSTEM_PROCESSOR "aarch64")
     endif()
@@ -97,7 +95,6 @@ set(SRC_FILES src/balance.c
     src/flushthread.c
     src/free-space.c
     src/fsctl.c
-    src/fsrtl.c
     src/galois.c
     src/pnp.c
     src/read.c
@@ -151,9 +148,6 @@ if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
 elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86")
     add_definitions(-D_X86_)
     set(MS_ARCH "x86")
-elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm")
-    add_definitions(-D_ARM_)
-    set(MS_ARCH "arm")
 elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
     add_definitions(-D_ARM64_)
     set(MS_ARCH "arm64")
@@ -187,15 +181,13 @@ if(MSVC)
 
     target_link_libraries(btrfs ntoskrnl hal)
 
-    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
         target_link_libraries(btrfs bufferoverflowfastfailk)
     else()
         target_link_libraries(btrfs BufferOverflowK)
     endif()
 
-    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm")
-        target_link_libraries(btrfs armrt)
-    elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
         target_link_libraries(btrfs arm64rt)
     endif()
 

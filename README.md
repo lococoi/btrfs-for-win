@@ -3,9 +3,13 @@ WinBtrfs v2.0
 
 
 WinBtrfs is a Windows driver for the next-generation Linux filesystem Btrfs.
-A reimplementation from scratch, it contains no code from the Linux kernel,
-and should work on any version from Windows XP onwards. It is also included
-as part of the free operating system [ReactOS](https://www.reactos.org/).
+A reimplementation from scratch, it contains no code from the Linux kernel.
+
+This fork supports Windows 10 and Windows 11 only (x86, x64 and ARM64). The
+support for older versions of Windows that upstream carries - XP, Server 2003,
+Vista, 7, 8, and 32-bit ARM - has been removed: those code paths are gone, the
+INF files require Windows 10, and the driver is built against the Win10 RS5
+WDK headers.
 
 If your Btrfs filesystem is on a MD software RAID device created by Linux, you
 will also need [WinMD](https://github.com/maharmstone/winmd) to get this to appear
@@ -268,22 +272,11 @@ for Windows, you're out of luck.
 Thecus uses Linux's MD raid for its block devices. You will need to install [WinMD](https://github.com/maharmstone/winmd)
 as well.
 
-* 64-bit Windows 7 won't load the driver
-
-Make sure that you have [KB3033929](https://www.microsoft.com/en-gb/download/details.aspx?id=46148) installed.
-Or consider installing from an "escrow" ISO which includes all updates.
-
 * The drive doesn't show up and Paragon software has been installed
 
 Paragon's filesystem-reading software is known to disable automount. Disable or
 uninstall Paragon, then re-enable automount by running `diskpart` and typing
 `automount enable`.
-
-* The drive doesn't show up on very old versions of Windows
-
-On very old versions of Windows (XP, Server 2003?), Windows ignores Linux partitions
-entirely. If this is the case for you, try running `fdisk` on Linux and changing your
-partition type from 83 to 7.
 
 * I can edit files on Windows that I shouldn't be able to
 
@@ -304,12 +297,6 @@ ARM seems to be funny in that requires you to be in test mode to install the
 driver, but not to use it otherwise. From an elevated command prompt, run
 `bcdedit /set testsigning on` and reboot, then try again. You can turn test
 mode off again afterwards: `bcdedit /set testsigning off`.
-
-* The shell extension doesn't work on Windows XP
-
-Recent versions of MSVC have dropped support for userspace programs on Windows
-XP - only the driver itself works. You might have some success with compiling
-shellbtrfs.dll yourself with mingw.
 
 * The driver doesn't load on Windows 11
 

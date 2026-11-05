@@ -17,7 +17,6 @@
 
 #include "btrfs_drv.h"
 
-extern tFsRtlValidateReparsePointBuffer fFsRtlValidateReparsePointBuffer;
 
 typedef struct {
     uint32_t unknown;
@@ -327,7 +326,7 @@ NTSTATUS set_reparse_point2(fcb* fcb, REPARSE_DATA_BUFFER* rdb, ULONG buflen, cc
         return STATUS_INVALID_BUFFER_SIZE;
     }
 
-    Status = fFsRtlValidateReparsePointBuffer(buflen, rdb);
+    Status = FsRtlValidateReparsePointBuffer(buflen, rdb);
     if (!NT_SUCCESS(Status)) {
         ERR("FsRtlValidateReparsePointBuffer returned %08lx\n", Status);
         return Status;

@@ -325,57 +325,11 @@ static void register_clsid(const GUID clsid, const WCHAR* description) {
     CoTaskMemFree(clsidstring);
 }
 
-// implementation of RegDeleteTreeW, only available from Vista on
 static void reg_delete_tree(HKEY hkey, const wstring& keyname) {
-    HKEY k;
-    LSTATUS ret;
-
-    ret = RegOpenKeyExW(hkey, keyname.c_str(), 0, KEY_READ, &k);
+    LSTATUS ret = RegDeleteTreeW(hkey, keyname.c_str());
 
     if (ret != ERROR_SUCCESS)
         throw last_error(ret);
-
-    try {
-        WCHAR* buf;
-        ULONG bufsize;
-
-        ret = RegQueryInfoKeyW(k, nullptr, nullptr, nullptr, nullptr, &bufsize, nullptr,
-                               nullptr, nullptr, nullptr, nullptr, nullptr);
-        if (ret != ERROR_SUCCESS)
-            throw last_error(ret);
-
-        bufsize++;
-        buf = new WCHAR[bufsize];
-
-        try {
-            do {
-                ULONG size = bufsize;
-
-                ret = RegEnumKeyExW(k, 0, buf, &size, nullptr, nullptr, nullptr, nullptr);
-
-                if (ret == ERROR_NO_MORE_ITEMS)
-                    break;
-                else if (ret != ERROR_SUCCESS)
-                    throw last_error(ret);
-
-                reg_delete_tree(k, buf);
-            } while (true);
-
-            ret = RegDeleteKeyW(hkey, keyname.c_str());
-            if (ret != ERROR_SUCCESS)
-                throw last_error(ret);
-        } catch (...) {
-            delete[] buf;
-            throw;
-        }
-
-        delete[] buf;
-    } catch (...) {
-        RegCloseKey(k);
-        throw;
-    }
-
-    RegCloseKey(k);
 }
 
 static void unregister_clsid(const GUID clsid) {

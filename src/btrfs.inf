@@ -33,12 +33,6 @@ CopyFiles   = Btrfs.DriverFiles,Btrfs.DllFiles
 AddReg      = shellbtrfs_AddReg
 CopyINF     = btrfs-vol.inf
 
-[DefaultInstall.NTarm]
-OptionDesc  = %ServiceDescription%
-CopyFiles   = Btrfs.DriverFiles,Btrfs.DllFiles
-AddReg      = shellbtrfs_AddReg
-CopyINF     = btrfs-vol.inf
-
 [DefaultInstall.NTarm64]
 OptionDesc  = %ServiceDescription%
 CopyFiles   = Btrfs.DriverFiles,Btrfs.DllFiles
@@ -49,9 +43,6 @@ CopyINF     = btrfs-vol.inf
 AddService  = %ServiceName%,0x802,Btrfs.Service
 
 [DefaultInstall.NTx86.Services]
-AddService  = %ServiceName%,0x802,Btrfs.Service
-
-[DefaultInstall.NTarm.Services]
 AddService  = %ServiceName%,0x802,Btrfs.Service
 
 [DefaultInstall.NTarm64.Services]
@@ -93,9 +84,6 @@ mkbtrfs.exe = 1,,
 
 [SourceDisksNames.amd64]
 1 = %DiskId1%,,,\amd64
-
-[SourceDisksNames.arm]
-1 = %DiskId1%,,,\arm
 
 [SourceDisksNames.arm64]
 1 = %DiskId1%,,,\aarch64

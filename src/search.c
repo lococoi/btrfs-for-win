@@ -36,7 +36,6 @@ extern KEVENT mountmgr_thread_event;
 extern HANDLE mountmgr_thread_handle;
 extern bool shutting_down;
 extern PDEVICE_OBJECT busobj;
-extern tIoUnregisterPlugPlayNotificationEx fIoUnregisterPlugPlayNotificationEx;
 extern ERESOURCE boot_lock;
 extern PDRIVER_OBJECT drvobj;
 
@@ -533,10 +532,7 @@ void remove_volume_child(_Inout_ _Requires_exclusive_lock_held_(_Curr_->child_lo
     device_extension* Vcb = vde->mounted_device ? vde->mounted_device->DeviceExtension : NULL;
 
     if (vc->notification_entry) {
-        if (fIoUnregisterPlugPlayNotificationEx)
-            fIoUnregisterPlugPlayNotificationEx(vc->notification_entry);
-        else
-            IoUnregisterPlugPlayNotification(vc->notification_entry);
+        IoUnregisterPlugPlayNotificationEx(vc->notification_entry);
     }
 
     if (vde->mounted_device && (!Vcb || !Vcb->options.allow_degraded)) {

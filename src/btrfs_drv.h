@@ -1658,7 +1658,6 @@ NTSTATUS send_subvol(device_extension* Vcb, void* data, ULONG datalen, PFILE_OBJ
 NTSTATUS read_send_buffer(device_extension* Vcb, PFILE_OBJECT FileObject, void* data, ULONG datalen, ULONG_PTR* retlen, KPROCESSOR_MODE processor_mode);
 
 // in fsrtl.c
-NTSTATUS __stdcall compat_FsRtlValidateReparsePointBuffer(IN ULONG BufferLength, IN PREPARSE_DATA_BUFFER ReparseBuffer);
 
 // in boot.c
 void check_system_root();
@@ -1843,44 +1842,9 @@ static __inline uint64_t fcb_alloc_size(fcb* fcb) {
         return sector_align(fcb->inode_item.size, fcb->Vcb->superblock.sectorsize);
 }
 
-typedef BOOLEAN (__stdcall *tPsIsDiskCountersEnabled)();
-
-typedef VOID (__stdcall *tPsUpdateDiskCounters)(PEPROCESS Process, ULONG64 BytesRead, ULONG64 BytesWritten,
-                                                ULONG ReadOperationCount, ULONG WriteOperationCount, ULONG FlushOperationCount);
-
-typedef BOOLEAN (__stdcall *tCcCopyWriteEx)(PFILE_OBJECT FileObject, PLARGE_INTEGER FileOffset, ULONG Length, BOOLEAN Wait,
-                                            PVOID Buffer, PETHREAD IoIssuerThread);
-
-typedef BOOLEAN (__stdcall *tCcCopyReadEx)(PFILE_OBJECT FileObject, PLARGE_INTEGER FileOffset, ULONG Length, BOOLEAN Wait,
-                                           PVOID Buffer, PIO_STATUS_BLOCK IoStatus, PETHREAD IoIssuerThread);
-
 #ifndef CC_ENABLE_DISK_IO_ACCOUNTING
 #define CC_ENABLE_DISK_IO_ACCOUNTING 0x00000010
 #endif
-
-typedef VOID (__stdcall *tCcSetAdditionalCacheAttributesEx)(PFILE_OBJECT FileObject, ULONG Flags);
-
-typedef VOID (__stdcall *tFsRtlUpdateDiskCounters)(ULONG64 BytesRead, ULONG64 BytesWritten);
-
-typedef NTSTATUS (__stdcall *tIoUnregisterPlugPlayNotificationEx)(PVOID NotificationEntry);
-
-typedef NTSTATUS (__stdcall *tFsRtlGetEcpListFromIrp)(PIRP Irp, PECP_LIST* EcpList);
-
-typedef NTSTATUS (__stdcall *tFsRtlGetNextExtraCreateParameter)(PECP_LIST EcpList, PVOID CurrentEcpContext, LPGUID NextEcpType,
-                                                                PVOID* NextEcpContext, ULONG* NextEcpContextSize);
-
-typedef NTSTATUS (__stdcall *tFsRtlValidateReparsePointBuffer)(ULONG BufferLength, PREPARSE_DATA_BUFFER ReparseBuffer);
-
-typedef BOOLEAN (__stdcall *tFsRtlCheckLockForOplockRequest)(PFILE_LOCK FileLock, PLARGE_INTEGER AllocationSize);
-
-typedef BOOLEAN (__stdcall *tFsRtlAreThereCurrentOrInProgressFileLocks)(PFILE_LOCK FileLock);
-
-typedef BOOLEAN (__stdcall *tFsRtlCurrentOplockH)(POPLOCK Oplock);
-
-typedef NTSTATUS (__stdcall *tFsRtlOplockBreakH)(POPLOCK Oplock, PIRP Irp,
-                                                 ULONG Flags, PVOID Context,
-                                                 POPLOCK_WAIT_COMPLETE_ROUTINE CompletionRoutine,
-                                                 POPLOCK_FS_PREPOST_IRP PostIrpRoutine);
 
 #ifndef _MSC_VER
 PEPROCESS __stdcall PsGetThreadProcess(_In_ PETHREAD Thread); // not in mingw

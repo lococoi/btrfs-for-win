@@ -88,19 +88,6 @@ uint32_t mount_nodatacow = 0;
 uint32_t no_pnp = 0;
 bool log_started = false;
 UNICODE_STRING log_device, log_file, registry_path;
-tPsUpdateDiskCounters fPsUpdateDiskCounters;
-tCcCopyReadEx fCcCopyReadEx;
-tCcCopyWriteEx fCcCopyWriteEx;
-tCcSetAdditionalCacheAttributesEx fCcSetAdditionalCacheAttributesEx;
-tFsRtlUpdateDiskCounters fFsRtlUpdateDiskCounters;
-tIoUnregisterPlugPlayNotificationEx fIoUnregisterPlugPlayNotificationEx;
-tFsRtlGetEcpListFromIrp fFsRtlGetEcpListFromIrp;
-tFsRtlGetNextExtraCreateParameter fFsRtlGetNextExtraCreateParameter;
-tFsRtlValidateReparsePointBuffer fFsRtlValidateReparsePointBuffer;
-tFsRtlCheckLockForOplockRequest fFsRtlCheckLockForOplockRequest;
-tFsRtlAreThereCurrentOrInProgressFileLocks fFsRtlAreThereCurrentOrInProgressFileLocks;
-tFsRtlCurrentOplockH fFsRtlCurrentOplockH;
-tFsRtlOplockBreakH fFsRtlOplockBreakH;
 bool diskacc = false;
 void *notification_entry = NULL, *notification_entry2 = NULL, *notification_entry3 = NULL;
 ERESOURCE pdo_list_lock, mapping_lock;
@@ -111,7 +98,6 @@ bool degraded_wait = true;
 KEVENT mountmgr_thread_event;
 bool shutting_down = false;
 ERESOURCE boot_lock;
-bool is_windows_8;
 extern uint64_t boot_subvol;
 
 #ifdef _DEBUG
@@ -133,9 +119,6 @@ typedef struct {
     KEVENT Event;
     IO_STATUS_BLOCK iosb;
 } read_context;
-
-// no longer in Windows headers??
-extern BOOLEAN WdmlibRtlIsNtDdiVersionAvailable(ULONG Version);
 
 #ifdef _DEBUG
 _Function_class_(IO_COMPLETION_ROUTINE)
@@ -808,7 +791,7 @@ static bool lie_about_fs_type() {
     return false;
 }
 
-// version of RtlUTF8ToUnicodeN for Vista and below
+// UTF-8/UTF-16 conversion helpers
 NTSTATUS utf8_to_utf16(WCHAR* dest, ULONG dest_max, ULONG* dest_len, char* src, ULONG src_len) {
     NTSTATUS Status = STATUS_SUCCESS;
     uint8_t* in = (uint8_t*)src;
@@ -891,7 +874,7 @@ NTSTATUS utf8_to_utf16(WCHAR* dest, ULONG dest_max, ULONG* dest_len, char* src, 
     return Status;
 }
 
-// version of RtlUnicodeToUTF8N for Vista and below
+// UTF-16/UTF-8 conversion helper
 NTSTATUS utf16_to_utf8(char* dest, ULONG dest_max, ULONG* dest_len, WCHAR* src, ULONG src_len) {
     NTSTATUS Status = STATUS_SUCCESS;
     uint16_t* in = (uint16_t*)src;
@@ -4091,7 +4074,7 @@ void init_file_cache(_In_ PFILE_OBJECT FileObject, _In_ CC_FILE_SIZES* ccfs) {
     CcInitializeCacheMap(FileObject, ccfs, false, &cache_callbacks, FileObject);
 
     if (diskacc)
-        fCcSetAdditionalCacheAttributesEx(FileObject, CC_ENABLE_DISK_IO_ACCOUNTING);
+        CcSetAdditionalCacheAttributesEx(FileObject, CC_ENABLE_DISK_IO_ACCOUNTING);
 
     CcSetReadAheadGranularity(FileObject, READ_AHEAD_GRANULARITY);
 }
@@ -5503,28 +5486,19 @@ void do_shutdown(PIRP Irp) {
     IoUnregisterFileSystem(master_devobj);
 
     if (notification_entry2) {
-        if (fIoUnregisterPlugPlayNotificationEx)
-            fIoUnregisterPlugPlayNotificationEx(notification_entry2);
-        else
-            IoUnregisterPlugPlayNotification(notification_entry2);
+        IoUnregisterPlugPlayNotificationEx(notification_entry2);
 
         notification_entry2 = NULL;
     }
 
     if (notification_entry3) {
-        if (fIoUnregisterPlugPlayNotificationEx)
-            fIoUnregisterPlugPlayNotificationEx(notification_entry3);
-        else
-            IoUnregisterPlugPlayNotification(notification_entry3);
+        IoUnregisterPlugPlayNotificationEx(notification_entry3);
 
         notification_entry3 = NULL;
     }
 
     if (notification_entry) {
-        if (fIoUnregisterPlugPlayNotificationEx)
-            fIoUnregisterPlugPlayNotificationEx(notification_entry);
-        else
-            IoUnregisterPlugPlayNotification(notification_entry);
+        IoUnregisterPlugPlayNotificationEx(notification_entry);
 
         notification_entry = NULL;
     }
@@ -6259,7 +6233,7 @@ NTSTATUS __stdcall AddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT Physica
     *anp = ')';
 
     Status = IoCreateDevice(drvobj, sizeof(volume_device_extension), &volname, FILE_DEVICE_DISK,
-                            is_windows_8 ? FILE_DEVICE_ALLOW_APPCONTAINER_TRAVERSAL : 0, false, &voldev);
+                            FILE_DEVICE_ALLOW_APPCONTAINER_TRAVERSAL, false, &voldev);
     if (!NT_SUCCESS(Status)) {
         ERR("IoCreateDevice returned %08lx\n", Status);
         goto end2;
@@ -6330,18 +6304,6 @@ NTSTATUS __stdcall DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_S
     HANDLE regh;
     OBJECT_ATTRIBUTES oa, system_thread_attributes;
     ULONG dispos;
-    RTL_OSVERSIONINFOW ver;
-
-    ver.dwOSVersionInfoSize = sizeof(RTL_OSVERSIONINFOW);
-
-    Status = RtlGetVersion(&ver);
-    if (!NT_SUCCESS(Status)) {
-        ERR("RtlGetVersion returned %08lx\n", Status);
-        return Status;
-    }
-
-    is_windows_8 = ver.dwMajorVersion > 6 || (ver.dwMajorVersion == 6 && ver.dwMinorVersion >= 2);
-
     KeInitializeSpinLock(&fve_data_lock);
 
     InitializeListHead(&uid_map_list);
@@ -6382,83 +6344,7 @@ NTSTATUS __stdcall DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_S
     check_cpu();
 #endif
 
-    if (ver.dwMajorVersion > 6 || (ver.dwMajorVersion == 6 && ver.dwMinorVersion >= 2)) { // Windows 8 or above
-        UNICODE_STRING name;
-        tPsIsDiskCountersEnabled fPsIsDiskCountersEnabled;
-
-        RtlInitUnicodeString(&name, L"PsIsDiskCountersEnabled");
-        fPsIsDiskCountersEnabled = (tPsIsDiskCountersEnabled)MmGetSystemRoutineAddress(&name);
-
-        if (fPsIsDiskCountersEnabled) {
-            diskacc = fPsIsDiskCountersEnabled();
-
-            RtlInitUnicodeString(&name, L"PsUpdateDiskCounters");
-            fPsUpdateDiskCounters = (tPsUpdateDiskCounters)MmGetSystemRoutineAddress(&name);
-
-            if (!fPsUpdateDiskCounters)
-                diskacc = false;
-
-            RtlInitUnicodeString(&name, L"FsRtlUpdateDiskCounters");
-            fFsRtlUpdateDiskCounters = (tFsRtlUpdateDiskCounters)MmGetSystemRoutineAddress(&name);
-        }
-
-        RtlInitUnicodeString(&name, L"CcCopyReadEx");
-        fCcCopyReadEx = (tCcCopyReadEx)MmGetSystemRoutineAddress(&name);
-
-        RtlInitUnicodeString(&name, L"CcCopyWriteEx");
-        fCcCopyWriteEx = (tCcCopyWriteEx)MmGetSystemRoutineAddress(&name);
-
-        RtlInitUnicodeString(&name, L"CcSetAdditionalCacheAttributesEx");
-        fCcSetAdditionalCacheAttributesEx = (tCcSetAdditionalCacheAttributesEx)MmGetSystemRoutineAddress(&name);
-
-        RtlInitUnicodeString(&name, L"FsRtlCheckLockForOplockRequest");
-        fFsRtlCheckLockForOplockRequest = (tFsRtlCheckLockForOplockRequest)MmGetSystemRoutineAddress(&name);
-    } else {
-        fPsUpdateDiskCounters = NULL;
-        fCcCopyReadEx = NULL;
-        fCcCopyWriteEx = NULL;
-        fCcSetAdditionalCacheAttributesEx = NULL;
-        fFsRtlUpdateDiskCounters = NULL;
-        fFsRtlCheckLockForOplockRequest = NULL;
-    }
-
-    if (ver.dwMajorVersion > 6 || (ver.dwMajorVersion == 6 && ver.dwMinorVersion >= 1)) { // Windows 7 or above
-        UNICODE_STRING name;
-
-        RtlInitUnicodeString(&name, L"IoUnregisterPlugPlayNotificationEx");
-        fIoUnregisterPlugPlayNotificationEx = (tIoUnregisterPlugPlayNotificationEx)MmGetSystemRoutineAddress(&name);
-
-        RtlInitUnicodeString(&name, L"FsRtlAreThereCurrentOrInProgressFileLocks");
-        fFsRtlAreThereCurrentOrInProgressFileLocks = (tFsRtlAreThereCurrentOrInProgressFileLocks)MmGetSystemRoutineAddress(&name);
-
-        RtlInitUnicodeString(&name, L"FsRtlCurrentOplockH");
-        fFsRtlCurrentOplockH = (tFsRtlCurrentOplockH)MmGetSystemRoutineAddress(&name);
-
-        RtlInitUnicodeString(&name, L"FsRtlOplockBreakH");
-        fFsRtlOplockBreakH = (tFsRtlOplockBreakH)MmGetSystemRoutineAddress(&name);
-    } else {
-        fIoUnregisterPlugPlayNotificationEx = NULL;
-        fFsRtlAreThereCurrentOrInProgressFileLocks = NULL;
-        fFsRtlCurrentOplockH = NULL;
-        fFsRtlOplockBreakH = NULL;
-    }
-
-    if (ver.dwMajorVersion >= 6) { // Windows Vista or above
-        UNICODE_STRING name;
-
-        RtlInitUnicodeString(&name, L"FsRtlGetEcpListFromIrp");
-        fFsRtlGetEcpListFromIrp = (tFsRtlGetEcpListFromIrp)MmGetSystemRoutineAddress(&name);
-
-        RtlInitUnicodeString(&name, L"FsRtlGetNextExtraCreateParameter");
-        fFsRtlGetNextExtraCreateParameter = (tFsRtlGetNextExtraCreateParameter)MmGetSystemRoutineAddress(&name);
-
-        RtlInitUnicodeString(&name, L"FsRtlValidateReparsePointBuffer");
-        fFsRtlValidateReparsePointBuffer = (tFsRtlValidateReparsePointBuffer)MmGetSystemRoutineAddress(&name);
-    } else {
-        fFsRtlGetEcpListFromIrp = NULL;
-        fFsRtlGetNextExtraCreateParameter = NULL;
-        fFsRtlValidateReparsePointBuffer = compat_FsRtlValidateReparsePointBuffer;
-    }
+    diskacc = PsIsDiskCountersEnabled();
 
     drvobj = DriverObject;
 

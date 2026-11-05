@@ -30,9 +30,6 @@ static NTSTATUS __stdcall write_data_completion(PDEVICE_OBJECT DeviceObject, PIR
 
 static NTSTATUS remove_fcb_extent(fcb* fcb, extent* ext, LIST_ENTRY* rollback) __attribute__((nonnull(1, 2)));
 
-extern tPsUpdateDiskCounters fPsUpdateDiskCounters;
-extern tCcCopyWriteEx fCcCopyWriteEx;
-extern tFsRtlUpdateDiskCounters fFsRtlUpdateDiskCounters;
 extern bool diskacc;
 
 __attribute__((nonnull(1, 2, 4)))
@@ -2114,7 +2111,7 @@ NTSTATUS write_data(_In_ device_extension* Vcb, _In_ uint64_t address, _In_reads
     }
 
     if (diskacc)
-        fFsRtlUpdateDiskCounters(0, total_writing);
+        FsRtlUpdateDiskCounters(0, total_writing);
 
     Status = STATUS_SUCCESS;
 
@@ -4608,21 +4605,12 @@ NTSTATUS write_file2(device_extension* Vcb, PIRP Irp, LARGE_INTEGER offset, void
                 /* We have to wait in CcCopyWrite - if we return STATUS_PENDING and add this to the work queue,
                  * it can result in CcFlushCache being called before the job has run. See ifstest ReadWriteTest. */
 
-                if (fCcCopyWriteEx) {
-                    TRACE("CcCopyWriteEx(%p, %I64x, %lx, %u, %p, %p)\n", FileObject, off64, *length, true, buf, Irp->Tail.Overlay.Thread);
-                    if (!fCcCopyWriteEx(FileObject, &offset, *length, true, buf, Irp->Tail.Overlay.Thread)) {
-                        Status = STATUS_PENDING;
-                        goto end;
-                    }
-                    TRACE("CcCopyWriteEx finished\n");
-                } else {
-                    TRACE("CcCopyWrite(%p, %I64x, %lx, %u, %p)\n", FileObject, off64, *length, true, buf);
-                    if (!CcCopyWrite(FileObject, &offset, *length, true, buf)) {
-                        Status = STATUS_PENDING;
-                        goto end;
-                    }
-                    TRACE("CcCopyWrite finished\n");
+                TRACE("CcCopyWriteEx(%p, %I64x, %lx, %u, %p, %p)\n", FileObject, off64, *length, true, buf, Irp->Tail.Overlay.Thread);
+                if (!CcCopyWriteEx(FileObject, &offset, *length, true, buf, Irp->Tail.Overlay.Thread)) {
+                    Status = STATUS_PENDING;
+                    goto end;
                 }
+                TRACE("CcCopyWriteEx finished\n");
 
                 Irp->IoStatus.Information = *length;
             }
@@ -4986,7 +4974,7 @@ NTSTATUS write_file(device_extension* Vcb, PIRP Irp, bool wait, bool deferred_wr
                 thread = PsGetCurrentThread();
 
             if (thread)
-                fPsUpdateDiskCounters(PsGetThreadProcess(thread), 0, IrpSp->Parameters.Write.Length, 0, 1, 0);
+                PsUpdateDiskCounters(PsGetThreadProcess(thread), 0, IrpSp->Parameters.Write.Length, 0, 1, 0);
         }
     }
 

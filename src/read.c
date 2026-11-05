@@ -59,9 +59,6 @@ typedef struct {
 
 
 extern bool diskacc;
-extern tPsUpdateDiskCounters fPsUpdateDiskCounters;
-extern tCcCopyReadEx fCcCopyReadEx;
-extern tFsRtlUpdateDiskCounters fFsRtlUpdateDiskCounters;
 
 #define LZO_PAGE_SIZE 4096
 
@@ -2614,7 +2611,7 @@ NTSTATUS read_data(_In_ device_extension* Vcb, _In_ uint64_t addr, _In_ uint32_t
         KeWaitForSingleObject(&context.Event, Executive, KernelMode, false, NULL);
 
     if (diskacc)
-        fFsRtlUpdateDiskCounters(total_reading, 0);
+        FsRtlUpdateDiskCounters(total_reading, 0);
 
     // check if any of the devices return a "user-induced" error
 
@@ -3431,22 +3428,12 @@ NTSTATUS do_read(PIRP Irp, bool wait, ULONG* bytes_read) {
                 init_file_cache(FileObject, &ccfs);
             }
 
-            if (fCcCopyReadEx) {
+            {
                 TRACE("CcCopyReadEx(%p, %I64x, %lx, %u, %p, %p, %p)\n", FileObject, IrpSp->Parameters.Read.ByteOffset.QuadPart,
                         length, wait, data, &Irp->IoStatus, Irp->Tail.Overlay.Thread);
                 TRACE("sizes = %I64x, %I64x, %I64x\n", fcb->Header.AllocationSize.QuadPart, fcb->Header.FileSize.QuadPart, fcb->Header.ValidDataLength.QuadPart);
-                if (!fCcCopyReadEx(FileObject, &IrpSp->Parameters.Read.ByteOffset, length, wait, data, &Irp->IoStatus, Irp->Tail.Overlay.Thread)) {
+                if (!CcCopyReadEx(FileObject, &IrpSp->Parameters.Read.ByteOffset, length, wait, data, &Irp->IoStatus, Irp->Tail.Overlay.Thread)) {
                     TRACE("CcCopyReadEx could not wait\n");
-
-                    IoMarkIrpPending(Irp);
-                    return STATUS_PENDING;
-                }
-                TRACE("CcCopyReadEx finished\n");
-            } else {
-                TRACE("CcCopyRead(%p, %I64x, %lx, %u, %p, %p)\n", FileObject, IrpSp->Parameters.Read.ByteOffset.QuadPart, length, wait, data, &Irp->IoStatus);
-                TRACE("sizes = %I64x, %I64x, %I64x\n", fcb->Header.AllocationSize.QuadPart, fcb->Header.FileSize.QuadPart, fcb->Header.ValidDataLength.QuadPart);
-                if (!CcCopyRead(FileObject, &IrpSp->Parameters.Read.ByteOffset, length, wait, data, &Irp->IoStatus)) {
-                    TRACE("CcCopyRead could not wait\n");
 
                     IoMarkIrpPending(Irp);
                     return STATUS_PENDING;
@@ -3501,7 +3488,7 @@ NTSTATUS do_read(PIRP Irp, bool wait, ULONG* bytes_read) {
                 thread = PsGetCurrentThread();
 
             if (thread)
-                fPsUpdateDiskCounters(PsGetThreadProcess(thread), *bytes_read, 0, 1, 0, 0);
+                PsUpdateDiskCounters(PsGetThreadProcess(thread), *bytes_read, 0, 1, 0, 0);
         }
 
         return Status;

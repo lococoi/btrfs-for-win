@@ -39,8 +39,6 @@
 extern LIST_ENTRY VcbList;
 extern ERESOURCE global_loading_lock;
 extern PDRIVER_OBJECT drvobj;
-extern tFsRtlCheckLockForOplockRequest fFsRtlCheckLockForOplockRequest;
-extern tFsRtlAreThereCurrentOrInProgressFileLocks fFsRtlAreThereCurrentOrInProgressFileLocks;
 
 static void mark_subvol_dirty(device_extension* Vcb, root* r);
 
@@ -5042,12 +5040,7 @@ static NTSTATUS fsctl_oplock(device_extension* Vcb, PIRP* Pirp) {
         fsctl == FSCTL_REQUEST_OPLOCK_LEVEL_2 || oplock_request) {
         if (shared_request) {
             if (fcb->type == BTRFS_FT_REG_FILE) {
-                if (fFsRtlCheckLockForOplockRequest)
-                    oplock_count = !fFsRtlCheckLockForOplockRequest(&fcb->lock, &fcb->Header.AllocationSize);
-                else if (fFsRtlAreThereCurrentOrInProgressFileLocks)
-                    oplock_count = fFsRtlAreThereCurrentOrInProgressFileLocks(&fcb->lock);
-                else
-                    oplock_count = FsRtlAreThereCurrentFileLocks(&fcb->lock);
+                oplock_count = !FsRtlCheckLockForOplockRequest(&fcb->lock, &fcb->Header.AllocationSize);
             }
         } else
             oplock_count = fileref->open_count;
@@ -5682,7 +5675,6 @@ NTSTATUS fsctl_request(PDEVICE_OBJECT DeviceObject, PIRP* Pirp, uint32_t type) {
             Status = STATUS_INVALID_DEVICE_REQUEST;
             break;
 
-#if _WIN32_WINNT >= 0x0600
         case FSCTL_MAKE_MEDIA_COMPATIBLE:
             WARN("STUB: FSCTL_MAKE_MEDIA_COMPATIBLE\n");
             Status = STATUS_INVALID_DEVICE_REQUEST;
@@ -5852,7 +5844,7 @@ NTSTATUS fsctl_request(PDEVICE_OBJECT DeviceObject, PIRP* Pirp, uint32_t type) {
             WARN("STUB: FSCTL_CSV_CONTROL\n");
             Status = STATUS_INVALID_DEVICE_REQUEST;
             break;
-#endif
+
         // TRACE rather than WARN because Windows 10 spams this undocumented fsctl
         case FSCTL_QUERY_VOLUME_CONTAINER_STATE:
             TRACE("STUB: FSCTL_QUERY_VOLUME_CONTAINER_STATE\n");
