@@ -262,10 +262,10 @@ static void find_devices(HWND, const GUID* guid, const mountmgr& mm, vector<devi
                                 dev.fstype = fs_ident[i].name;
 
                                 if (dev.fstype == L"Btrfs") {
-                                    superblock* bsb = (superblock*)sb;
+                                    struct btrfs_super_block* bsb = (struct btrfs_super_block*)sb;
 
-                                    RtlCopyMemory(&dev.fs_uuid, &bsb->uuid, sizeof(BTRFS_UUID));
-                                    RtlCopyMemory(&dev.dev_uuid, &bsb->dev_item.device_uuid, sizeof(BTRFS_UUID));
+                                    RtlCopyMemory(&dev.fs_uuid, &bsb->fsid, BTRFS_UUID_SIZE);
+                                    RtlCopyMemory(&dev.dev_uuid, &bsb->dev_item.uuid, BTRFS_UUID_SIZE);
                                 }
 
                                 break;
@@ -313,7 +313,7 @@ void BtrfsDeviceAdd::populate_device_tree(HWND tree) {
     HWND hwnd = GetParent(tree);
     unsigned int i;
     ULONG last_disk_num = 0xffffffff;
-    HTREEITEM diskitem;
+    HTREEITEM diskitem = nullptr;
     NTSTATUS Status;
     OBJECT_ATTRIBUTES attr;
     UNICODE_STRING us;
@@ -399,7 +399,7 @@ void BtrfsDeviceAdd::populate_device_tree(HWND tree) {
                 btrfs_filesystem* bfs2 = bfs;
 
                 while (true) {
-                    if (RtlCompareMemory(&bfs2->uuid, &device_list[i].fs_uuid, sizeof(BTRFS_UUID)) == sizeof(BTRFS_UUID)) {
+                    if (RtlCompareMemory(&bfs2->uuid, &device_list[i].fs_uuid, BTRFS_UUID_SIZE) == BTRFS_UUID_SIZE) {
                         ULONG j, k;
                         btrfs_filesystem_device* dev;
 
@@ -409,10 +409,10 @@ void BtrfsDeviceAdd::populate_device_tree(HWND tree) {
                             else
                                 dev = (btrfs_filesystem_device*)((uint8_t*)dev + offsetof(btrfs_filesystem_device, name[0]) + dev->name_length);
 
-                            if (RtlCompareMemory(&device_list[i].dev_uuid, &device_list[i].dev_uuid, sizeof(BTRFS_UUID)) == sizeof(BTRFS_UUID)) {
+                            if (RtlCompareMemory(dev->uuid, device_list[i].dev_uuid, BTRFS_UUID_SIZE) == BTRFS_UUID_SIZE) {
                                 for (k = 0; k < device_list.size(); k++) {
                                     if (k != i && device_list[k].fstype == L"Btrfs" && device_list[k].drive != L"" &&
-                                        RtlCompareMemory(&device_list[k].fs_uuid, &device_list[i].fs_uuid, sizeof(BTRFS_UUID)) == sizeof(BTRFS_UUID)) {
+                                        RtlCompareMemory(&device_list[k].fs_uuid, &device_list[i].fs_uuid, BTRFS_UUID_SIZE) == BTRFS_UUID_SIZE) {
                                         device_list[i].drive = device_list[k].drive;
                                         break;
                                     }

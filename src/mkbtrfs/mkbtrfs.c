@@ -90,10 +90,10 @@ int main(int argc, char** argv) {
     ULONG sector_size = 0, node_size = 0;
     int i;
     bool invalid_args = false;
-    uint64_t incompat_flags = BTRFS_INCOMPAT_FLAGS_EXTENDED_IREF | BTRFS_INCOMPAT_FLAGS_SKINNY_METADATA |
-                              BTRFS_INCOMPAT_FLAGS_NO_HOLES;
-    uint64_t compat_ro_flags = BTRFS_COMPAT_RO_FLAGS_FREE_SPACE_CACHE;
-    uint16_t csum_type = CSUM_TYPE_CRC32C;
+    uint64_t incompat_flags = BTRFS_FEATURE_INCOMPAT_EXTENDED_IREF | BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA |
+                              BTRFS_FEATURE_INCOMPAT_NO_HOLES;
+    uint64_t compat_ro_flags = BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE;
+    uint16_t csum_type = BTRFS_CSUM_TYPE_CRC32;
     pSetIncompatFlags SetIncompatFlags;
     pSetCsumType SetCsumType;
 
@@ -136,42 +136,42 @@ int main(int argc, char** argv) {
                     v = &colon[1];
 
                     if (!_stricmp(v, "crc32c"))
-                        csum_type = CSUM_TYPE_CRC32C;
+                        csum_type = BTRFS_CSUM_TYPE_CRC32;
                     else if (!_stricmp(v, "xxhash"))
-                        csum_type = CSUM_TYPE_XXHASH;
+                        csum_type = BTRFS_CSUM_TYPE_XXHASH;
                     else if (!_stricmp(v, "sha256"))
-                        csum_type = CSUM_TYPE_SHA256;
+                        csum_type = BTRFS_CSUM_TYPE_SHA256;
                     else if (!_stricmp(v, "blake2"))
-                        csum_type = CSUM_TYPE_BLAKE2;
+                        csum_type = BTRFS_CSUM_TYPE_BLAKE2;
                     else {
                         print_string(stdout, IDS_INVALID_CSUM_TYPE);
                         invalid_args = true;
                         break;
                     }
                 } else if (!_stricmp(cmd, "mixed"))
-                    incompat_flags |= BTRFS_INCOMPAT_FLAGS_MIXED_GROUPS;
+                    incompat_flags |= BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS;
                 else if (!_stricmp(cmd, "notmixed"))
-                    incompat_flags &= ~BTRFS_INCOMPAT_FLAGS_MIXED_GROUPS;
+                    incompat_flags &= ~BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS;
                 else if (!_stricmp(cmd, "extiref"))
-                    incompat_flags |= BTRFS_INCOMPAT_FLAGS_EXTENDED_IREF;
+                    incompat_flags |= BTRFS_FEATURE_INCOMPAT_EXTENDED_IREF;
                 else if (!_stricmp(cmd, "notextiref"))
-                    incompat_flags &= ~BTRFS_INCOMPAT_FLAGS_EXTENDED_IREF;
+                    incompat_flags &= ~BTRFS_FEATURE_INCOMPAT_EXTENDED_IREF;
                 else if (!_stricmp(cmd, "skinnymetadata"))
-                    incompat_flags |= BTRFS_INCOMPAT_FLAGS_SKINNY_METADATA;
+                    incompat_flags |= BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA;
                 else if (!_stricmp(cmd, "notskinnymetadata"))
-                    incompat_flags &= ~BTRFS_INCOMPAT_FLAGS_SKINNY_METADATA;
+                    incompat_flags &= ~BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA;
                 else if (!_stricmp(cmd, "noholes"))
-                    incompat_flags |= BTRFS_INCOMPAT_FLAGS_NO_HOLES;
+                    incompat_flags |= BTRFS_FEATURE_INCOMPAT_NO_HOLES;
                 else if (!_stricmp(cmd, "notnoholes"))
-                    incompat_flags &= ~BTRFS_INCOMPAT_FLAGS_NO_HOLES;
+                    incompat_flags &= ~BTRFS_FEATURE_INCOMPAT_NO_HOLES;
                 else if (!_stricmp(cmd, "freespacetree"))
-                    compat_ro_flags |= BTRFS_COMPAT_RO_FLAGS_FREE_SPACE_CACHE;
+                    compat_ro_flags |= BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE;
                 else if (!_stricmp(cmd, "notfreespacetree"))
-                    compat_ro_flags &= ~BTRFS_COMPAT_RO_FLAGS_FREE_SPACE_CACHE;
+                    compat_ro_flags &= ~BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE;
                 else if (!_stricmp(cmd, "blockgrouptree"))
-                    compat_ro_flags |= BTRFS_COMPAT_RO_FLAGS_BLOCK_GROUP_TREE;
+                    compat_ro_flags |= BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE;
                 else if (!_stricmp(cmd, "notblockgrouptree"))
-                    compat_ro_flags &= ~BTRFS_COMPAT_RO_FLAGS_BLOCK_GROUP_TREE;
+                    compat_ro_flags &= ~BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE;
                 else {
                     print_string(stdout, IDS_UNKNOWN_ARG);
                     invalid_args = true;
@@ -311,13 +311,13 @@ int main(int argc, char** argv) {
 
     // From Linux btrfs/disk-io.c: "Artificial requirement for block-group-tree to force
     // newer features (free-space-tree, no-holes) so the test matrix is smaller."
-    if (compat_ro_flags & BTRFS_COMPAT_RO_FLAGS_BLOCK_GROUP_TREE) {
-        compat_ro_flags |= BTRFS_COMPAT_RO_FLAGS_FREE_SPACE_CACHE;
-        incompat_flags |= BTRFS_INCOMPAT_FLAGS_NO_HOLES;
+    if (compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE) {
+        compat_ro_flags |= BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE;
+        incompat_flags |= BTRFS_FEATURE_INCOMPAT_NO_HOLES;
     }
 
-    if (compat_ro_flags & BTRFS_COMPAT_RO_FLAGS_FREE_SPACE_CACHE)
-        compat_ro_flags |= BTRFS_COMPAT_RO_FLAGS_FREE_SPACE_CACHE_VALID;
+    if (compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE)
+        compat_ro_flags |= BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID;
 
     SetIncompatFlags = (pSetIncompatFlags)GetProcAddress(ubtrfs, "SetIncompatFlags");
 

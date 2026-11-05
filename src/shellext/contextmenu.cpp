@@ -547,7 +547,7 @@ void BtrfsContextMenu::reflink_copy(HWND hwnd, const WCHAR* fn, const WCHAR* dir
         throw ntstatus_error(Status);
 
     // if subvol, do snapshot instead
-    if (bii.inode == SUBVOL_ROOT_INODE) {
+    if (bii.inode == BTRFS_FIRST_FREE_OBJECTID) {
         btrfs_create_snapshot* bcs;
         win_handle dirh;
         wstring destname, search;
@@ -601,7 +601,7 @@ void BtrfsContextMenu::reflink_copy(HWND hwnd, const WCHAR* fn, const WCHAR* dir
     if (!NT_SUCCESS(Status))
         throw ntstatus_error(Status);
 
-    if (bii.type == BTRFS_TYPE_CHARDEV || bii.type == BTRFS_TYPE_BLOCKDEV || bii.type == BTRFS_TYPE_FIFO || bii.type == BTRFS_TYPE_SOCKET) {
+    if (bii.type == BTRFS_FT_CHRDEV || bii.type == BTRFS_FT_BLKDEV || bii.type == BTRFS_FT_FIFO || bii.type == BTRFS_FT_SOCK) {
         win_handle dirh;
         btrfs_mknod* bmn;
 
@@ -614,7 +614,7 @@ void BtrfsContextMenu::reflink_copy(HWND hwnd, const WCHAR* fn, const WCHAR* dir
 
         bmn->inode = 0;
         bmn->type = bii.type;
-        bmn->st_rdev = bii.st_rdev;
+        bmn->rdev = bii.rdev;
         bmn->namelen = (uint16_t)(wcslen(name) * sizeof(WCHAR));
         memcpy(bmn->name, name, bmn->namelen);
 
@@ -1287,7 +1287,7 @@ static void reflink_copy2(const wstring& srcfn, const wstring& destdir, const ws
         throw ntstatus_error(Status);
 
     // if subvol, do snapshot instead
-    if (bii.inode == SUBVOL_ROOT_INODE) {
+    if (bii.inode == BTRFS_FIRST_FREE_OBJECTID) {
         btrfs_create_snapshot* bcs;
         win_handle dirh;
 
@@ -1316,7 +1316,7 @@ static void reflink_copy2(const wstring& srcfn, const wstring& destdir, const ws
     if (!NT_SUCCESS(Status))
         throw ntstatus_error(Status);
 
-    if (bii.type == BTRFS_TYPE_CHARDEV || bii.type == BTRFS_TYPE_BLOCKDEV || bii.type == BTRFS_TYPE_FIFO || bii.type == BTRFS_TYPE_SOCKET) {
+    if (bii.type == BTRFS_FT_CHRDEV || bii.type == BTRFS_FT_BLKDEV || bii.type == BTRFS_FT_FIFO || bii.type == BTRFS_FT_SOCK) {
         win_handle dirh;
         btrfs_mknod* bmn;
 
@@ -1329,7 +1329,7 @@ static void reflink_copy2(const wstring& srcfn, const wstring& destdir, const ws
 
         bmn->inode = 0;
         bmn->type = bii.type;
-        bmn->st_rdev = bii.st_rdev;
+        bmn->rdev = bii.rdev;
         bmn->namelen = (uint16_t)(destname.length() * sizeof(WCHAR));
         memcpy(bmn->name, destname.c_str(), bmn->namelen);
 
@@ -1627,7 +1627,7 @@ extern "C" void CALLBACK ReflinkCopyW(HWND, HINSTANCE, LPWSTR lpszCmdLine, int) 
                 destdir = L"";
                 destname = dest;
             } else {
-                destdir = dest.substr(0, found);
+                destdir = dest.substr(0, found + 1);
                 destname = dest.substr(found + 1);
             }
         }

@@ -74,3 +74,4 @@ plans/
 # Benchmark harness (scripts, downloaded tools, results, VM images)
 # ------------------------------------------------------------------
 benchmark/
+.pi/

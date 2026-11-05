@@ -30,7 +30,7 @@
 #include "propsheet.h"
 #include "resource.h"
 
-#define SUBVOL_ROOT_INODE 0x100
+#define BTRFS_FIRST_FREE_OBJECTID 0x100
 
 #ifndef __MINGW32__ // in winternl.h in mingw
 
@@ -190,9 +190,9 @@ HRESULT BtrfsPropSheet::check_file(const wstring& fn, UINT i, UINT num_files, UI
             subvol = bii2.subvol;
             inode = bii2.inode;
             type = bii2.type;
-            uid = bii2.st_uid;
-            gid = bii2.st_gid;
-            rdev = bii2.st_rdev;
+            uid = bii2.uid;
+            gid = bii2.gid;
+            rdev = bii2.rdev;
         } else {
             if (subvol != bii2.subvol)
                 various_subvols = true;
@@ -203,10 +203,10 @@ HRESULT BtrfsPropSheet::check_file(const wstring& fn, UINT i, UINT num_files, UI
             if (type != bii2.type)
                 various_types = true;
 
-            if (uid != bii2.st_uid)
+            if (uid != bii2.uid)
                 various_uids = true;
 
-            if (gid != bii2.st_gid)
+            if (gid != bii2.gid)
                 various_gids = true;
         }
 
@@ -250,14 +250,14 @@ HRESULT BtrfsPropSheet::check_file(const wstring& fn, UINT i, UINT num_files, UI
         else
             allocsize += fsi.AllocationSize.QuadPart;
 
-        min_mode |= ~bii2.st_mode;
-        max_mode |= bii2.st_mode;
+        min_mode |= ~bii2.mode;
+        max_mode |= bii2.mode;
         min_flags |= ~bii2.flags;
         max_flags |= bii2.flags;
         min_compression_type = bii2.compression_type < min_compression_type ? bii2.compression_type : min_compression_type;
         max_compression_type = bii2.compression_type > max_compression_type ? bii2.compression_type : max_compression_type;
 
-        if (bii2.inode == SUBVOL_ROOT_INODE) {
+        if (bii2.inode == BTRFS_FIRST_FREE_OBJECTID) {
             bool ro = bhfi.dwFileAttributes & FILE_ATTRIBUTE_READONLY;
 
             has_subvols = true;
@@ -274,7 +274,7 @@ HRESULT BtrfsPropSheet::check_file(const wstring& fn, UINT i, UINT num_files, UI
 
         ignore = false;
 
-        if (bii2.type != BTRFS_TYPE_DIRECTORY && GetFileSizeEx(h, &filesize)) {
+        if (bii2.type != BTRFS_FT_DIR && GetFileSizeEx(h, &filesize)) {
             if (filesize.QuadPart != 0)
                 can_change_nocow = false;
         }
@@ -435,9 +435,9 @@ void BtrfsPropSheet::set_cmdline(const wstring& cmdline) {
         subvol = bii2.subvol;
         inode = bii2.inode;
         type = bii2.type;
-        uid = bii2.st_uid;
-        gid = bii2.st_gid;
-        rdev = bii2.st_rdev;
+        uid = bii2.uid;
+        gid = bii2.gid;
+        rdev = bii2.rdev;
 
         if (bii2.inline_length > 0) {
             totalsize += bii2.inline_length;
@@ -478,14 +478,14 @@ void BtrfsPropSheet::set_cmdline(const wstring& cmdline) {
         else
             allocsize += fsi.AllocationSize.QuadPart;
 
-        min_mode |= ~bii2.st_mode;
-        max_mode |= bii2.st_mode;
+        min_mode |= ~bii2.mode;
+        max_mode |= bii2.mode;
         min_flags |= ~bii2.flags;
         max_flags |= bii2.flags;
         min_compression_type = bii2.compression_type < min_compression_type ? bii2.compression_type : min_compression_type;
         max_compression_type = bii2.compression_type > max_compression_type ? bii2.compression_type : max_compression_type;
 
-        if (bii2.inode == SUBVOL_ROOT_INODE) {
+        if (bii2.inode == BTRFS_FIRST_FREE_OBJECTID) {
             bool ro = bhfi.dwFileAttributes & FILE_ATTRIBUTE_READONLY;
 
             has_subvols = true;
@@ -502,7 +502,7 @@ void BtrfsPropSheet::set_cmdline(const wstring& cmdline) {
 
         ignore = false;
 
-        if (bii2.type != BTRFS_TYPE_DIRECTORY && GetFileSizeEx(h, &filesize)) {
+        if (bii2.type != BTRFS_FT_DIR && GetFileSizeEx(h, &filesize)) {
             if (filesize.QuadPart != 0)
                 can_change_nocow = false;
         }
@@ -530,25 +530,25 @@ void BtrfsPropSheet::set_cmdline(const wstring& cmdline) {
 
 static ULONG inode_type_to_string_ref(uint8_t type) {
     switch (type) {
-        case BTRFS_TYPE_FILE:
+        case BTRFS_FT_REG_FILE:
             return IDS_INODE_FILE;
 
-        case BTRFS_TYPE_DIRECTORY:
+        case BTRFS_FT_DIR:
             return IDS_INODE_DIR;
 
-        case BTRFS_TYPE_CHARDEV:
+        case BTRFS_FT_CHRDEV:
             return IDS_INODE_CHAR;
 
-        case BTRFS_TYPE_BLOCKDEV:
+        case BTRFS_FT_BLKDEV:
             return IDS_INODE_BLOCK;
 
-        case BTRFS_TYPE_FIFO:
+        case BTRFS_FT_FIFO:
             return IDS_INODE_FIFO;
 
-        case BTRFS_TYPE_SOCKET:
+        case BTRFS_FT_SOCK:
             return IDS_INODE_SOCKET;
 
-        case BTRFS_TYPE_SYMLINK:
+        case BTRFS_FT_SYMLINK:
             return IDS_INODE_SYMLINK;
 
         default:
@@ -615,7 +615,7 @@ void BtrfsPropSheet::apply_changes_file(HWND, const wstring& fn) {
     if (!NT_SUCCESS(Status))
         throw ntstatus_error(Status);
 
-    if (bii2.inode == SUBVOL_ROOT_INODE && ro_changed) {
+    if (bii2.inode == BTRFS_FIRST_FREE_OBJECTID && ro_changed) {
         BY_HANDLE_FILE_INFORMATION bhfi;
         FILE_BASIC_INFO fbi;
 
@@ -643,17 +643,17 @@ void BtrfsPropSheet::apply_changes_file(HWND, const wstring& fn) {
 
         if (perms_changed) {
             bsii.mode_changed = true;
-            bsii.st_mode = (bii2.st_mode & ~mode_set) | (mode & mode_set);
+            bsii.mode = (bii2.mode & ~mode_set) | (mode & mode_set);
         }
 
         if (uid_changed) {
             bsii.uid_changed = true;
-            bsii.st_uid = uid;
+            bsii.uid = uid;
         }
 
         if (gid_changed) {
             bsii.gid_changed = true;
-            bsii.st_gid = gid;
+            bsii.gid = gid;
         }
 
         if (compress_type_changed) {

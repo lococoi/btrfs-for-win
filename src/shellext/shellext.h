@@ -42,23 +42,23 @@ using namespace std;
 #define STATUS_CANNOT_DELETE            (NTSTATUS)0xc0000121
 #define STATUS_NOT_FOUND                (NTSTATUS)0xc0000225
 
-#define BLOCK_FLAG_DATA         0x001
-#define BLOCK_FLAG_SYSTEM       0x002
-#define BLOCK_FLAG_METADATA     0x004
-#define BLOCK_FLAG_RAID0        0x008
-#define BLOCK_FLAG_RAID1        0x010
-#define BLOCK_FLAG_DUPLICATE    0x020
-#define BLOCK_FLAG_RAID10       0x040
-#define BLOCK_FLAG_RAID5        0x080
-#define BLOCK_FLAG_RAID6        0x100
+#define BTRFS_BLOCK_GROUP_DATA         0x001
+#define BTRFS_BLOCK_GROUP_SYSTEM       0x002
+#define BTRFS_BLOCK_GROUP_METADATA     0x004
+#define BTRFS_BLOCK_GROUP_RAID0        0x008
+#define BTRFS_BLOCK_GROUP_RAID1        0x010
+#define BTRFS_BLOCK_GROUP_DUP          0x020
+#define BTRFS_BLOCK_GROUP_RAID10       0x040
+#define BTRFS_BLOCK_GROUP_RAID5        0x080
+#define BTRFS_BLOCK_GROUP_RAID6        0x100
 
-#define BTRFS_TYPE_FILE      1
-#define BTRFS_TYPE_DIRECTORY 2
-#define BTRFS_TYPE_CHARDEV   3
-#define BTRFS_TYPE_BLOCKDEV  4
-#define BTRFS_TYPE_FIFO      5
-#define BTRFS_TYPE_SOCKET    6
-#define BTRFS_TYPE_SYMLINK   7
+#define BTRFS_FT_REG_FILE      1
+#define BTRFS_FT_DIR           2
+#define BTRFS_FT_CHRDEV        3
+#define BTRFS_FT_BLKDEV        4
+#define BTRFS_FT_FIFO          5
+#define BTRFS_FT_SOCK          6
+#define BTRFS_FT_SYMLINK       7
 
 #ifdef _MSC_VER
 #define funcname __FUNCTION__
@@ -155,13 +155,6 @@ typedef struct _REPARSE_DATA_BUFFER {
 #define SYMLINK_FLAG_RELATIVE 1
 
 #ifndef _MSC_VER
-
-typedef struct _DUPLICATE_EXTENTS_DATA {
-    HANDLE FileHandle;
-    LARGE_INTEGER SourceFileOffset;
-    LARGE_INTEGER TargetFileOffset;
-    LARGE_INTEGER ByteCount;
-} DUPLICATE_EXTENTS_DATA, *PDUPLICATE_EXTENTS_DATA;
 
 typedef struct _FSCTL_GET_INTEGRITY_INFORMATION_BUFFER {
     WORD ChecksumAlgorithm;

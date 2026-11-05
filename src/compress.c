@@ -793,7 +793,7 @@ NTSTATUS zstd_compress(uint8_t* inbuf, uint32_t inlen, uint8_t* outbuf, uint32_t
     size_t init_res, written;
     ZSTD_inBuffer input;
     ZSTD_outBuffer output;
-    ZSTD_parameters params;
+    ZSTD_compressionParameters cparams;
 
     stream = ZSTD_createCStream_advanced(zstd_mem);
 
@@ -802,15 +802,28 @@ NTSTATUS zstd_compress(uint8_t* inbuf, uint32_t inlen, uint8_t* outbuf, uint32_t
         return STATUS_INTERNAL_ERROR;
     }
 
-    params = ZSTD_getParams(level, inlen, 0);
+    cparams = ZSTD_getCParams(level, inlen, 0);
 
-    if (params.cParams.windowLog > ZSTD_BTRFS_MAX_WINDOWLOG)
-        params.cParams.windowLog = ZSTD_BTRFS_MAX_WINDOWLOG;
+    if (cparams.windowLog > ZSTD_BTRFS_MAX_WINDOWLOG)
+        cparams.windowLog = ZSTD_BTRFS_MAX_WINDOWLOG;
 
-    init_res = ZSTD_initCStream_advanced(stream, NULL, 0, params, inlen);
-
+    init_res = ZSTD_CCtx_setParameter(stream, ZSTD_c_compressionLevel, level);
     if (ZSTD_isError(init_res)) {
-        ERR("ZSTD_initCStream_advanced failed: %s\n", ZSTD_getErrorName(init_res));
+        ERR("ZSTD_CCtx_setParameter failed: %s\n", ZSTD_getErrorName(init_res));
+        ZSTD_freeCStream(stream);
+        return STATUS_INTERNAL_ERROR;
+    }
+
+    init_res = ZSTD_CCtx_setParameter(stream, ZSTD_c_windowLog, cparams.windowLog);
+    if (ZSTD_isError(init_res)) {
+        ERR("ZSTD_CCtx_setParameter failed: %s\n", ZSTD_getErrorName(init_res));
+        ZSTD_freeCStream(stream);
+        return STATUS_INTERNAL_ERROR;
+    }
+
+    init_res = ZSTD_CCtx_setPledgedSrcSize(stream, inlen);
+    if (ZSTD_isError(init_res)) {
+        ERR("ZSTD_CCtx_setPledgedSrcSize failed: %s\n", ZSTD_getErrorName(init_res));
         ZSTD_freeCStream(stream);
         return STATUS_INTERNAL_ERROR;
     }
@@ -874,16 +887,16 @@ NTSTATUS write_compressed(fcb* fcb, uint64_t start_data, uint64_t end_data, void
     if (fcb->Vcb->options.compress_type != 0 && fcb->prop_compression == PropCompression_None)
         type = fcb->Vcb->options.compress_type;
     else {
-        if (!(fcb->Vcb->superblock.incompat_flags & BTRFS_INCOMPAT_FLAGS_COMPRESS_ZSTD) && fcb->prop_compression == PropCompression_ZSTD)
-            type = BTRFS_COMPRESSION_ZSTD;
-        else if (fcb->Vcb->superblock.incompat_flags & BTRFS_INCOMPAT_FLAGS_COMPRESS_ZSTD && fcb->prop_compression != PropCompression_Zlib && fcb->prop_compression != PropCompression_LZO)
-            type = BTRFS_COMPRESSION_ZSTD;
-        else if (!(fcb->Vcb->superblock.incompat_flags & BTRFS_INCOMPAT_FLAGS_COMPRESS_LZO) && fcb->prop_compression == PropCompression_LZO)
-            type = BTRFS_COMPRESSION_LZO;
-        else if (fcb->Vcb->superblock.incompat_flags & BTRFS_INCOMPAT_FLAGS_COMPRESS_LZO && fcb->prop_compression != PropCompression_Zlib)
-            type = BTRFS_COMPRESSION_LZO;
+        if (!(fcb->Vcb->superblock.incompat_flags & BTRFS_FEATURE_INCOMPAT_COMPRESS_ZSTD) && fcb->prop_compression == PropCompression_ZSTD)
+            type = BTRFS_COMPRESS_ZSTD;
+        else if (fcb->Vcb->superblock.incompat_flags & BTRFS_FEATURE_INCOMPAT_COMPRESS_ZSTD && fcb->prop_compression != PropCompression_Zlib && fcb->prop_compression != PropCompression_LZO)
+            type = BTRFS_COMPRESS_ZSTD;
+        else if (!(fcb->Vcb->superblock.incompat_flags & BTRFS_FEATURE_INCOMPAT_COMPRESS_LZO) && fcb->prop_compression == PropCompression_LZO)
+            type = BTRFS_COMPRESS_LZO;
+        else if (fcb->Vcb->superblock.incompat_flags & BTRFS_FEATURE_INCOMPAT_COMPRESS_LZO && fcb->prop_compression != PropCompression_Zlib)
+            type = BTRFS_COMPRESS_LZO;
         else
-            type = BTRFS_COMPRESSION_ZLIB;
+            type = BTRFS_COMPRESS_ZLIB;
     }
 
     Status = excise_extents(fcb->Vcb, fcb, start_data, end_data, Irp, rollback);
@@ -942,25 +955,25 @@ NTSTATUS write_compressed(fcb* fcb, uint64_t start_data, uint64_t end_data, void
     }
 
     for (unsigned int i = 0; i < num_parts; i++) {
-        if (parts[i].cj->space_left >= fcb->Vcb->superblock.sector_size) {
+        if (parts[i].cj->space_left >= fcb->Vcb->superblock.sectorsize) {
             parts[i].compression_type = type;
             parts[i].outlen = parts[i].inlen - parts[i].cj->space_left;
 
-            if (type == BTRFS_COMPRESSION_LZO)
-                fcb->Vcb->superblock.incompat_flags |= BTRFS_INCOMPAT_FLAGS_COMPRESS_LZO;
-            else if (type == BTRFS_COMPRESSION_ZSTD)
-                fcb->Vcb->superblock.incompat_flags |= BTRFS_INCOMPAT_FLAGS_COMPRESS_ZSTD;
+            if (type == BTRFS_COMPRESS_LZO)
+                fcb->Vcb->superblock.incompat_flags |= BTRFS_FEATURE_INCOMPAT_COMPRESS_LZO;
+            else if (type == BTRFS_COMPRESS_ZSTD)
+                fcb->Vcb->superblock.incompat_flags |= BTRFS_FEATURE_INCOMPAT_COMPRESS_ZSTD;
 
-            if ((parts[i].outlen & (fcb->Vcb->superblock.sector_size - 1)) != 0) {
-                unsigned int newlen = (unsigned int)sector_align(parts[i].outlen, fcb->Vcb->superblock.sector_size);
+            if ((parts[i].outlen & (fcb->Vcb->superblock.sectorsize - 1)) != 0) {
+                unsigned int newlen = (unsigned int)sector_align(parts[i].outlen, fcb->Vcb->superblock.sectorsize);
 
                 RtlZeroMemory(parts[i].buf + parts[i].outlen, newlen - parts[i].outlen);
 
                 parts[i].outlen = newlen;
             }
         } else {
-            parts[i].compression_type = BTRFS_COMPRESSION_NONE;
-            parts[i].outlen = (unsigned int)sector_align(parts[i].inlen, fcb->Vcb->superblock.sector_size);
+            parts[i].compression_type = BTRFS_COMPRESS_NONE;
+            parts[i].outlen = (unsigned int)sector_align(parts[i].inlen, fcb->Vcb->superblock.sectorsize);
         }
 
         buflen += parts[i].outlen;
@@ -969,7 +982,7 @@ NTSTATUS write_compressed(fcb* fcb, uint64_t start_data, uint64_t end_data, void
 
     // check if first 128 KB of file is incompressible
 
-    if (start_data == 0 && parts[0].compression_type == BTRFS_COMPRESSION_NONE && !fcb->Vcb->options.compress_force) {
+    if (start_data == 0 && parts[0].compression_type == BTRFS_COMPRESS_NONE && !fcb->Vcb->options.compress_force) {
         TRACE("adding nocompress flag to subvol %I64x, inode %I64x\n", fcb->subvol->id, fcb->inode);
 
         fcb->inode_item.flags |= BTRFS_INODE_NOCOMPRESS;
@@ -990,7 +1003,7 @@ NTSTATUS write_compressed(fcb* fcb, uint64_t start_data, uint64_t end_data, void
         uint8_t* buf2 = buf;
 
         for (i = 0; i < num_parts; i++) {
-            if (parts[i].compression_type == BTRFS_COMPRESSION_NONE)
+            if (parts[i].compression_type == BTRFS_COMPRESS_NONE)
                 RtlCopyMemory(buf2, (uint8_t*)data + (i * COMPRESSED_EXTENT_SIZE), parts[i].outlen);
             else
                 RtlCopyMemory(buf2, parts[i].buf, parts[i].outlen);
@@ -1010,11 +1023,20 @@ NTSTATUS write_compressed(fcb* fcb, uint64_t start_data, uint64_t end_data, void
         if (!c2->readonly && !c2->reloc) {
             acquire_chunk_lock(c2, fcb->Vcb);
 
-            if (c2->chunk_item->type == fcb->Vcb->data_flags && (c2->chunk_item->size - c2->used) >= buflen) {
+            if (c2->chunk_item->type == fcb->Vcb->data_flags && (c2->chunk_item->length - c2->used) >= buflen) {
                 if (find_data_address_in_chunk(fcb->Vcb, c2, buflen, &address)) {
                     c = c2;
                     c->used += buflen;
-                    space_list_subtract(c, address, buflen, rollback);
+
+                    Status = space_list_subtract(c, address, buflen, rollback);
+                    if (!NT_SUCCESS(Status)) {
+                        release_chunk_lock(c2, fcb->Vcb);
+                        ExReleaseResourceLite(&fcb->Vcb->chunk_lock);
+                        ExFreePool(buf);
+                        ExFreePool(parts);
+                        return Status;
+                    }
+
                     release_chunk_lock(c2, fcb->Vcb);
                     break;
                 }
@@ -1049,7 +1071,14 @@ NTSTATUS write_compressed(fcb* fcb, uint64_t start_data, uint64_t end_data, void
         if (find_data_address_in_chunk(fcb->Vcb, c2, buflen, &address)) {
             c = c2;
             c->used += buflen;
-            space_list_subtract(c, address, buflen, rollback);
+
+            Status = space_list_subtract(c, address, buflen, rollback);
+            if (!NT_SUCCESS(Status)) {
+                release_chunk_lock(c2, fcb->Vcb);
+                ExFreePool(buf);
+                ExFreePool(parts);
+                return Status;
+            }
         }
 
         release_chunk_lock(c2, fcb->Vcb);
@@ -1100,11 +1129,10 @@ NTSTATUS write_compressed(fcb* fcb, uint64_t start_data, uint64_t end_data, void
     extaddr = address;
 
     for (i = 0; i < num_parts; i++) {
-        EXTENT_DATA* ed;
-        EXTENT_DATA2* ed2;
+        struct btrfs_file_extent_item* ed;
         void* csum2;
 
-        ed = ExAllocatePoolWithTag(PagedPool, offsetof(EXTENT_DATA, data[0]) + sizeof(EXTENT_DATA2), ALLOC_TAG);
+        ed = ExAllocatePoolWithTag(PagedPool, sizeof(struct btrfs_file_extent_item), ALLOC_TAG);
         if (!ed) {
             ERR("out of memory\n");
             ExFreePool(parts);
@@ -1116,17 +1144,15 @@ NTSTATUS write_compressed(fcb* fcb, uint64_t start_data, uint64_t end_data, void
         }
 
         ed->generation = fcb->Vcb->superblock.generation;
-        ed->decoded_size = parts[i].inlen;
+        ed->ram_bytes = parts[i].inlen;
         ed->compression = parts[i].compression_type;
-        ed->encryption = BTRFS_ENCRYPTION_NONE;
-        ed->encoding = BTRFS_ENCODING_NONE;
-        ed->type = EXTENT_TYPE_REGULAR;
-
-        ed2 = (EXTENT_DATA2*)ed->data;
-        ed2->address = extaddr;
-        ed2->size = parts[i].outlen;
-        ed2->offset = 0;
-        ed2->num_bytes = parts[i].inlen;
+        ed->encryption = 0;
+        ed->other_encoding = 0;
+        ed->type = BTRFS_FILE_EXTENT_REG;
+        ed->disk_bytenr = extaddr;
+        ed->disk_num_bytes = parts[i].outlen;
+        ed->offset = 0;
+        ed->num_bytes = parts[i].inlen;
 
         if (csum) {
             csum2 = ExAllocatePoolWithTag(PagedPool, (parts[i].outlen * fcb->Vcb->csum_size) >> fcb->Vcb->sector_shift, ALLOC_TAG);
@@ -1143,7 +1169,7 @@ NTSTATUS write_compressed(fcb* fcb, uint64_t start_data, uint64_t end_data, void
         } else
             csum2 = NULL;
 
-        Status = add_extent_to_fcb(fcb, start_data + (i * COMPRESSED_EXTENT_SIZE), ed, offsetof(EXTENT_DATA, data[0]) + sizeof(EXTENT_DATA2),
+        Status = add_extent_to_fcb(fcb, start_data + (i * COMPRESSED_EXTENT_SIZE), ed, sizeof(struct btrfs_file_extent_item),
                                    true, csum2, rollback);
         if (!NT_SUCCESS(Status)) {
             ERR("add_extent_to_fcb returned %08lx\n", Status);
@@ -1158,7 +1184,7 @@ NTSTATUS write_compressed(fcb* fcb, uint64_t start_data, uint64_t end_data, void
 
         ExFreePool(ed);
 
-        fcb->inode_item.st_blocks += parts[i].inlen;
+        fcb->inode_item.nbytes += parts[i].inlen;
 
         extaddr += parts[i].outlen;
     }
@@ -1173,8 +1199,15 @@ NTSTATUS write_compressed(fcb* fcb, uint64_t start_data, uint64_t end_data, void
     extaddr = address;
 
     for (i = 0; i < num_parts; i++) {
-        add_changed_extent_ref(c, extaddr, parts[i].outlen, fcb->subvol->id, fcb->inode,
-                               start_data + (i * COMPRESSED_EXTENT_SIZE), 1, fcb->inode_item.flags & BTRFS_INODE_NODATASUM);
+        Status = add_changed_extent_ref(c, extaddr, parts[i].outlen, fcb->subvol->id,
+                                        fcb->inode, start_data + (i * COMPRESSED_EXTENT_SIZE),
+                                        1, fcb->inode_item.flags & BTRFS_INODE_NODATASUM,
+                                        rollback);
+        if (!NT_SUCCESS(Status)) {
+            ExReleaseResourceLite(&c->changed_extents_lock);
+            ExFreePool(parts);
+            return Status;
+        }
 
         extaddr += parts[i].outlen;
     }

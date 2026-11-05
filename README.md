@@ -105,17 +105,18 @@ Windows 11 soft-requires Secure Boot, but will work fine with it turned off.
 Uninstalling
 ------------
 
-If you want to uninstall, from a command prompt run:
+If you want to uninstall, from an elevated command prompt first run:
 
+```pnputil /enum-drivers```
+
+There should be two entries for `btrfs.inf` and `btrfs-vol.inf`, with files of
+the form `oemNN.inf`. Make a note of their names.
+
+Then for each run...
 ```
-RUNDLL32.EXE SETUPAPI.DLL,InstallHinfSection DefaultUninstall 132 btrfs.inf
+pnputil /delete-driver oemNN.inf /uninstall /force
 ```
-
-You may need to give the full path to btrfs.inf.
-
-You can also go to Device Manager, find "Btrfs controller" under
-"Storage volumes", right click and choose "Uninstall". Tick the checkbox to
-uninstall the driver as well, and let Windows reboot itself.
+...and reboot.
 
 If you need to uninstall via the registry, open regedit and set the value of
 HKLM\SYSTEM\CurrentControlSet\services\btrfs\Start to 4, to disable the service.
@@ -142,10 +143,12 @@ name of your Windows SID (e.g. S-1-5-21-1379886684-2432464051-424789967-1001),
 and the value of your Linux uid (e.g. 1000). It will take effect next time the
 driver is loaded.
 
-You can find your current SID by running `wmic useraccount get name,sid`.
+You can find your current SID by running `whoami /user`.
 
-Similarly, the group mappings are stored in under GroupMappings. The default
-entry maps Windows' Users group to gid 100, which is usually "users" on Linux.
+Similarly, the group mappings are stored in under GroupMappings. You can find
+your group SIDs by running `whoami /groups`. The default entry maps Windows'
+Users group to gid 100, which is usually "users" on Linux.
+
 You can also specify user SIDs here to force files created by a user to belong
 to a certain group. The setgid flag also works as on Linux.
 
@@ -288,6 +291,34 @@ There's no mapping between Windows and POSIX permission models, they're too
 different for this to be practical. If this bothers you, you can create a
 Windows ACL on files that you don't want to be able to edit.
 
+* I can't see my volume in Disk Management / diskmgmt.msc
+
+No, sorry, you can't. We use a fake block device so that RAID works properly,
+and diskmgmt doesn't know anything about this. Your volume should appear in
+Explorer, and you can use the property sheet to change the drive letter if you
+wish.
+
+* I have an ARM laptop and it won't let me install
+
+ARM seems to be funny in that requires you to be in test mode to install the
+driver, but not to use it otherwise. From an elevated command prompt, run
+`bcdedit /set testsigning on` and reboot, then try again. You can turn test
+mode off again afterwards: `bcdedit /set testsigning off`.
+
+* The shell extension doesn't work on Windows XP
+
+Recent versions of MSVC have dropped support for userspace programs on Windows
+XP - only the driver itself works. You might have some success with compiling
+shellbtrfs.dll yourself with mingw.
+
+* The driver doesn't load on Windows 11
+
+Recent versions of Windows 11 have added a driver whitelist, but only if you
+have more than 250 hours of cumulative uptime (see https://support.microsoft.com/en-us/windows/hardware/drivers/the-windows-driver-policy).
+
+Make sure you are fully updated, run `CiTool.exe --remove-policy "{8F9CB695-5D48-48D6-A329-7202B44607E3}"`
+from an elevated command prompt, and reboot.
+
 Changelog
 ---------
 
@@ -307,6 +338,28 @@ v2.0 (2026-08-07) — Performance-optimised fork:
 * Upgraded bundled zstd and zlib submodules
 * Added GitHub Actions CI (builds on windows-latest with MSVC + WDK)
 * Added LICENSE (LGPL-3.0) and .gitignore
+
+v1.10 (2026-09-01):
+* Added support for writing free-space bitmaps (reading was already supported)
+* Added support for writing compressed inline files (reading was already supported)
+* Improved handling of removable devices
+* Tightened up error recovery on OOMs and ENOSPCs
+* Fixed crash when moving files across subvolumes, such as to the Recycle Bin
+* Fixed crash when many files created simultaneously, e.g. by Steam
+* Fixed extent tree corruption when writing to snapshots
+* Fixed preallocation issues (fixes rclone)
+* Fixed deadlock when querying hard links
+* Fixed memory corruption relating to watching the Registry
+* Fixed disk usage statistics for multi-device volumes
+* Fixed FSCTL_DUPLICATE_EXTENTS_TO_FILE sent from 32-bit userspace
+* Refactored to use same struct and constant definitions as on Linux
+
+Note that the changes to the handling of removable devices mean that RAID is now
+no longer supported for these, if for some reason you were doing that.
+
+Thank you to Anthropic, whose gift of free Claude Max 20 under the Claude Open
+Source Programme helped greatly in bug-hunting and code reviews. All of the code
+here was still written by hand.
 
 v1.9 (2024-03-15):
 * Added support for block group tree (Linux 6.1)

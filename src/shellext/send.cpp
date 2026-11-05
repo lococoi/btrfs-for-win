@@ -29,8 +29,8 @@ DWORD BtrfsSend::Thread() {
         NTSTATUS Status;
         IO_STATUS_BLOCK iosb;
         btrfs_send_subvol* bss;
-        btrfs_send_header header;
-        btrfs_send_command end;
+        btrfs_stream_header header;
+        btrfs_cmd_header end;
         ULONG i;
 
         buf = (char*)malloc(SEND_BUFFER_LEN);
@@ -128,7 +128,7 @@ DWORD BtrfsSend::Thread() {
                     throw string_error(IDS_SEND_CANT_OPEN_FILE, file, GetLastError(), format_message(GetLastError()).c_str());
 
                 try {
-                    memcpy(header.magic, BTRFS_SEND_MAGIC, sizeof(header.magic));
+                    memcpy(header.magic, BTRFS_SEND_STREAM_MAGIC, sizeof(header.magic));
                     header.version = 1;
 
                     if (!WriteFile(stream, &header, sizeof(header), nullptr, nullptr))
@@ -146,9 +146,9 @@ DWORD BtrfsSend::Thread() {
                     if (Status != STATUS_END_OF_FILE)
                         throw string_error(IDS_SEND_FSCTL_BTRFS_READ_SEND_BUFFER_FAILED, Status, format_ntstatus(Status).c_str());
 
-                    end.length = 0;
-                    end.cmd = BTRFS_SEND_CMD_END;
-                    end.csum = 0x9dc96c50;
+                    end.len = 0;
+                    end.cmd = BTRFS_SEND_C_END;
+                    end.crc = 0x9dc96c50;
 
                     if (!WriteFile(stream, &end, sizeof(end), nullptr, nullptr))
                         throw string_error(IDS_SEND_WRITEFILE_FAILED, GetLastError(), format_message(GetLastError()).c_str());
@@ -564,8 +564,8 @@ static void send_subvol(const wstring& subvol, const wstring& file, const wstrin
     btrfs_send_subvol* bss;
     IO_STATUS_BLOCK iosb;
     NTSTATUS Status;
-    btrfs_send_header header;
-    btrfs_send_command end;
+    btrfs_stream_header header;
+    btrfs_cmd_header end;
 
     buf = (char*)malloc(SEND_BUFFER_LEN);
 
@@ -627,7 +627,7 @@ static void send_subvol(const wstring& subvol, const wstring& file, const wstrin
             if (!NT_SUCCESS(Status))
                 throw ntstatus_error(Status);
 
-            memcpy(header.magic, BTRFS_SEND_MAGIC, sizeof(header.magic));
+            memcpy(header.magic, BTRFS_SEND_STREAM_MAGIC, sizeof(header.magic));
             header.version = 1;
 
             if (!WriteFile(stream, &header, sizeof(header), nullptr, nullptr))
@@ -643,9 +643,9 @@ static void send_subvol(const wstring& subvol, const wstring& file, const wstrin
             if (Status != STATUS_END_OF_FILE)
                 throw ntstatus_error(Status);
 
-            end.length = 0;
-            end.cmd = BTRFS_SEND_CMD_END;
-            end.csum = 0x9dc96c50;
+            end.len = 0;
+            end.cmd = BTRFS_SEND_C_END;
+            end.crc = 0x9dc96c50;
 
             if (!WriteFile(stream, &end, sizeof(end), nullptr, nullptr))
                 throw last_error(GetLastError());
