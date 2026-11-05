@@ -52,12 +52,27 @@ jobs:
       - name: Install Windows Driver Kit
         shell: pwsh
         run: |
-          function Get-WdkInclude {
-            Get-ChildItem "$env:ProgramFiles(x86)\Windows Kits\10\Include" -Directory -ErrorAction SilentlyContinue |
+          # NOTE: "${env:ProgramFiles(x86)}" needs the braces. "$env:ProgramFiles(x86)"
+          # silently expands to "C:\Program Files(x86)" - no space - so every path below
+          # it matches nothing.
+          function Get-KitsRoot {
+            foreach ($key in @('HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots',
+                               'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots')) {
+              $reg = Get-ItemProperty $key -Name KitsRoot10 -ErrorAction SilentlyContinue
+              if ($reg -and $reg.KitsRoot10 -and (Test-Path $reg.KitsRoot10)) { return $reg.KitsRoot10 }
+            }
+            return "${env:ProgramFiles(x86)}\Windows Kits\10"
+          }
+
+          function Get-WdkInclude([string]$root) {
+            Get-ChildItem (Join-Path $root 'Include') -Directory -ErrorAction SilentlyContinue |
               Where-Object { Test-Path (Join-Path $_.FullName 'km\ntifs.h') }
           }
 
-          $have = Get-WdkInclude
+          $root = Get-KitsRoot
+          echo "Windows Kits root: $root"
+
+          $have = Get-WdkInclude $root
           if ($have) {
             echo "WDK already present: $($have.FullName -join ', ')"
             exit 0
@@ -68,20 +83,29 @@ jobs:
             --accept-package-agreements --accept-source-agreements --disable-interactivity
           # winget returns non-zero for "already installed"; the check below is what
           # decides whether the install actually worked.
-          $have = Get-WdkInclude
+          $root = Get-KitsRoot
+          $have = Get-WdkInclude $root
           if (-not $have) {
-            throw "WDK installation failed: no Include\*\km\ntifs.h under Windows Kits"
+            $seen = Get-ChildItem (Join-Path $root 'Include') -Directory -ErrorAction SilentlyContinue |
+                      ForEach-Object { $_.FullName }
+            throw "WDK installation failed: no Include\*\km\ntifs.h under '$root'. Include dirs seen: $($seen -join ', ')"
           }
           echo "WDK installed: $($have.FullName -join ', ')"
 
       - name: Verify WDK kernel libs (${{ matrix.arch }})
         shell: pwsh
         run: |
+          $kits = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' `
+                    -Name KitsRoot10 -ErrorAction SilentlyContinue
+          $root = if ($kits -and $kits.KitsRoot10) { $kits.KitsRoot10 } else { "${env:ProgramFiles(x86)}\Windows Kits\10" }
+
           $msarch = if ("${{ matrix.arch }}" -eq "x86") { "x86" } else { "x64" }
-          $libs = Get-ChildItem "$env:ProgramFiles(x86)\Windows Kits\10\Lib" -Directory |
+          $libs = Get-ChildItem (Join-Path $root 'Lib') -Directory -ErrorAction SilentlyContinue |
                   Where-Object { Test-Path (Join-Path $_.FullName "km\$msarch\ntoskrnl.lib") }
           if (-not $libs) {
-            throw "No WDK kernel libs for $msarch (km\$msarch\ntoskrnl.lib). The installed WDK lacks that architecture."
+            $seen = Get-ChildItem (Join-Path $root 'Lib') -Directory -ErrorAction SilentlyContinue |
+                      ForEach-Object { $_.FullName }
+            throw "No WDK kernel libs for $msarch (km\$msarch\ntoskrnl.lib) under '$root'. Lib dirs seen: $($seen -join ', ')"
           }
           $libs | ForEach-Object { echo "kernel libs: $($_.FullName)\km\$msarch" }
 
