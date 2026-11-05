@@ -154,8 +154,49 @@ elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
 endif()
 
 if(MSVC)
-    include_directories("$ENV{WindowsSdkDir}Include\\$ENV{WindowsSDKLibVersion}km")
-    link_directories("$ENV{WindowsSdkDir}Lib\\$ENV{WindowsSDKLibVersion}km\\${MS_ARCH}")
+    # The kernel headers and libs come from the WDK, which installs them alongside the
+    # SDK under "<Windows Kits>/10". Look them up by ntifs.h instead of trusting the
+    # WindowsSdkDir/WindowsSDKLibVersion environment variables, which are only set when
+    # the build runs inside a vcvarsall environment and are not set at all on some CI
+    # runners (e.g. GitHub's windows-latest, which no longer ships the WDK).
+    set(WDK_KITS_ROOT "" CACHE PATH "Windows Kits 10 root containing Include/<version>/km")
+
+    if(NOT WDK_KITS_ROOT)
+        file(GLOB _wdk_ntifs
+            "$ENV{WindowsSdkDir}Include/*/km/ntifs.h"
+            "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/Include/*/km/ntifs.h"
+            "C:/Program Files (x86)/Windows Kits/10/Include/*/km/ntifs.h")
+
+        if(_wdk_ntifs)
+            list(SORT _wdk_ntifs)
+            list(GET _wdk_ntifs -1 _wdk_ntifs)
+            get_filename_component(_wdk_ver_dir "${_wdk_ntifs}" DIRECTORY)  # .../Include/10.0.x/km
+            get_filename_component(_wdk_ver_dir "${_wdk_ver_dir}" PATH)     # .../Include/10.0.x
+            get_filename_component(WDK_VERSION "${_wdk_ver_dir}" NAME)
+            get_filename_component(_wdk_inc "${_wdk_ver_dir}" PATH)         # .../Include
+            get_filename_component(WDK_KITS_ROOT "${_wdk_inc}" PATH)        # .../Windows Kits/10
+        endif()
+    endif()
+
+    if(WDK_KITS_ROOT AND EXISTS "${WDK_KITS_ROOT}/Include/${WDK_VERSION}/km/ntifs.h")
+        set(WDK_ARCH_LIB "${WDK_KITS_ROOT}/Lib/${WDK_VERSION}/km/${MS_ARCH}")
+        message(STATUS "WDK ${WDK_VERSION} found in ${WDK_KITS_ROOT}")
+
+        if(NOT EXISTS "${WDK_ARCH_LIB}/ntoskrnl.lib")
+            message(FATAL_ERROR
+                "The WDK in ${WDK_KITS_ROOT} has no kernel libs for ${MS_ARCH} "
+                "(looked for ${WDK_ARCH_LIB}/ntoskrnl.lib). Install the WDK component for "
+                "that architecture, or point -DWDK_KITS_ROOT= at a complete WDK.")
+        endif()
+
+        include_directories("${WDK_KITS_ROOT}/Include/${WDK_VERSION}/km")
+        link_directories("${WDK_ARCH_LIB}")
+    else()
+        message(FATAL_ERROR
+            "Windows Driver Kit not found: no Include/*/km/ntifs.h under Windows Kits. "
+            "Install it (winget install --id Microsoft.WindowsWDK.10.0.26100 -e) or pass "
+            "-DWDK_KITS_ROOT='C:/Program Files (x86)/Windows Kits/10'.")
+    endif()
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND WIN32)
     include_directories("${CMAKE_FIND_ROOT_PATH}/usr/include/ddk")
 endif()

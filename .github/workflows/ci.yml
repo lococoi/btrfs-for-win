@@ -1,0 +1,140 @@
+name: ci
+
+# Build only. Signing / publishing lives in cd.yml.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, x86]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Required by the user: run on a Node.js runtime > 24.
+      - name: Set up Node.js (>= 26)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          check-latest: true
+
+      - name: Verify Node.js version
+        shell: pwsh
+        run: |
+          $v = (node --version).TrimStart('v')
+          $major = [int]($v.Split('.')[0])
+          echo "Node version: $v"
+          if ($major -le 24) {
+            throw "Expected Node > 24, got v$v"
+          }
+
+      # windows-latest (2025) no longer ships the Windows Driver Kit, so the km
+      # headers and the per-arch kernel libs have to be installed.
+      - name: Install Windows Driver Kit
+        shell: pwsh
+        run: |
+          function Get-WdkInclude {
+            Get-ChildItem "$env:ProgramFiles(x86)\Windows Kits\10\Include" -Directory -ErrorAction SilentlyContinue |
+              Where-Object { Test-Path (Join-Path $_.FullName 'km\ntifs.h') }
+          }
+
+          $have = Get-WdkInclude
+          if ($have) {
+            echo "WDK already present: $($have.FullName -join ', ')"
+            exit 0
+          }
+
+          echo "WDK not found, installing via winget..."
+          winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --silent `
+            --accept-package-agreements --accept-source-agreements --disable-interactivity
+          # winget returns non-zero for "already installed"; the check below is what
+          # decides whether the install actually worked.
+          $have = Get-WdkInclude
+          if (-not $have) {
+            throw "WDK installation failed: no Include\*\km\ntifs.h under Windows Kits"
+          }
+          echo "WDK installed: $($have.FullName -join ', ')"
+
+      - name: Verify WDK kernel libs (${{ matrix.arch }})
+        shell: pwsh
+        run: |
+          $msarch = if ("${{ matrix.arch }}" -eq "x86") { "x86" } else { "x64" }
+          $libs = Get-ChildItem "$env:ProgramFiles(x86)\Windows Kits\10\Lib" -Directory |
+                  Where-Object { Test-Path (Join-Path $_.FullName "km\$msarch\ntoskrnl.lib") }
+          if (-not $libs) {
+            throw "No WDK kernel libs for $msarch (km\$msarch\ntoskrnl.lib). The installed WDK lacks that architecture."
+          }
+          $libs | ForEach-Object { echo "kernel libs: $($_.FullName)\km\$msarch" }
+
+      - name: Configure and build
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere)) {
+            throw "vswhere.exe not found at $vswhere"
+          }
+          $vsPath = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $vsPath) {
+            throw "Visual Studio with the VC++ x86/x64 toolset was not found"
+          }
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+          if (-not (Test-Path -LiteralPath $vcvars)) {
+            throw "vcvarsall.bat not found at $vcvars"
+          }
+
+          $arch = if ("${{ matrix.arch }}" -eq "x86") { "x86" } else { "amd64" }
+          $buildDir = "build\${{ matrix.arch }}"
+
+          $cmd = "call `"$vcvars`" $arch && cmake -S . -B `"$buildDir`" -G `"NMake Makefiles`" -DCMAKE_BUILD_TYPE=Release -DWITH_TEST=OFF && cmake --build `"$buildDir`" --config Release"
+          cmd /c "$cmd"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          $dir = "build\${{ matrix.arch }}"
+          $out = "stage"
+          New-Item -ItemType Directory -Force $out | Out-Null
+
+          $required = @("btrfs.sys", "shellbtrfs.dll", "ubtrfs.dll", "mkbtrfs.exe")
+          $missing = $required | Where-Object { -not (Test-Path (Join-Path $dir $_)) }
+          if ($missing) {
+            throw "Missing build outputs in ${dir}: $($missing -join ', ')"
+          }
+
+          foreach ($f in $required) { Copy-Item (Join-Path $dir $f) $out }
+          Get-ChildItem $dir -Filter *.pdb -ErrorAction SilentlyContinue | Copy-Item -Destination $out
+          Copy-Item src/btrfs.inf, src/btrfs-vol.inf $out
+
+          Get-ChildItem $out | ForEach-Object { "{0}  ({1:N0} bytes)" -f $_.Name, $_.Length }
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 14
+          path: stage/

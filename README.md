@@ -130,13 +130,31 @@ C:\Windows\System32\drivers\btrfs.sys.
 Compilation
 -----------
 
-To compile with Visual C++ 2019, open the directory and let CMake do its thing.
-If you have the Windows DDK installed correctly, it should just work.
+To compile with Visual Studio (2019 or later), open the directory and let CMake do its thing.
+It needs the Windows Driver Kit, which supplies the `km` headers and the kernel import
+libraries; CMake looks for the newest `Include/\*/km/ntifs.h` under `Windows Kits\10` and
+fails with a clear message if it can't find it (override with `-DWDK_KITS_ROOT=...`).
+Building from a plain `cmd` works, no need for a Developer Command Prompt:
+
+```
+call "%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" amd64
+cmake -S . -B build\amd64 -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build build\amd64 --config Release
+```
 
 To compile with GCC on Linux, you will need a cross-compiler set up, for either
 `i686-w64-mingw32` or `x86_64-w64-mingw32`. Create a build directory, then use
 either `mingw-x86.cmake` or `mingw-amd64.cmake` as CMake toolchain files to
 generate your Makefile.
+
+CI and releases
+---------------
+
+`.github/workflows/ci.yml` builds x86 and x64 on every push to `master` and on every pull
+request (installing the WDK first, as `windows-latest` no longer ships it) and uploads the
+binaries as artifacts. `.github/workflows/cd.yml` is the publishing half: push a `v*` tag
+and it runs the same CI build, stamps the tag into `DriverVer`, zips the packages and
+attaches them to a GitHub release with a `SHA256SUMS.txt`.
 
 Mappings
 --------

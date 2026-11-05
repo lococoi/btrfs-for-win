@@ -1,0 +1,139 @@
+name: cd
+
+# Publishing only: runs the CI build, then attaches the packages to a GitHub
+# release. Trigger by pushing a tag (v2.0.1, v2.1, ...) or manually from the
+# Actions tab.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (must already exist, e.g. v2.0.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          if [[ -z "$tag" || "$tag" != v* ]]; then
+            echo "::error::Not a version tag: '$tag' (expected something like v2.0.1)"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: btrfs-*
+
+      - name: Package
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          ver="${TAG#v}"
+          IFS=. read -r a b c <<<"$ver"
+          ver4="${a:-0}.${b:-0}.${c:-0}.0"
+          drvdate="$(git log -1 --format=%cd --date=format:%m/%d/%Y)"
+          echo "Packaging $TAG as driver version $ver4, DriverVer date $drvdate"
+
+          shopt -s nullglob
+          mkdir -p dist
+
+          for arch in amd64 x86; do
+            src="artifacts/btrfs-$arch"
+            if [[ ! -d "$src" ]]; then
+              echo "::error::missing artifact btrfs-$arch"
+              exit 1
+            fi
+
+            root="dist/btrfs-for-win-${TAG}-${arch}"
+            mkdir -p "$root"
+            cp -a "$src"/. "$root"/
+
+            # Keep DriverVer in step with the tag: Windows ranks drivers by this
+            # date, so a fresh release must not look older than the previous one.
+            sed -i -E "s|^DriverVer[[:space:]]*=.*|DriverVer   = ${drvdate},${ver4}|" \
+              "$root/btrfs.inf" "$root/btrfs-vol.inf"
+
+            grep -i '^DriverVer' "$root/btrfs.inf" "$root/btrfs-vol.inf"
+            ( cd dist && zip -qr "btrfs-for-win-${TAG}-${arch}.zip" "$(basename "$root")" )
+            rm -rf "$root"
+          done
+
+          ( cd dist && sha256sum *.zip > SHA256SUMS.txt && cat SHA256SUMS.txt )
+
+      - name: Write release notes
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<'EOF'
+          Unsigned builds for **Windows 10 and 11** (x86, x64).
+
+          Packages: `btrfs.sys`, `btrfs.inf`, `btrfs-vol.inf`, `shellbtrfs.dll`,
+          `ubtrfs.dll`, `mkbtrfs.exe` and the matching `.pdb` files.
+
+          These binaries are **not code-signed**. Before installing, either enable
+          test signing and sign `btrfs.sys` with your own certificate, or sign the
+          package with a proper cross-signing certificate. See the README
+          ("Installation") for the exact steps.
+
+          Install with: right-click `btrfs.inf` and choose *Install*, or
+          `pnputil /add-driver btrfs.inf /install`.
+
+          `SHA256SUMS.txt` covers the zips.
+          EOF
+          cat notes.md
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, uploading assets"
+            gh release upload "$TAG" dist/*.zip dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$TAG" dist/*.zip dist/SHA256SUMS.txt \
+              --title "WinBtrfs fork $TAG" \
+              --notes-file notes.md
+          fi
