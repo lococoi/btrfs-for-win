@@ -57,35 +57,6 @@ typedef struct {
     uint8_t* va;
 } read_data_context;
 
-// =============================================================================
-// Extent Prefetch Cache
-// Detects sequential read patterns and prefetches upcoming extent data into a
-// small in-memory cache. This helps when reads bypass the Windows Cache Manager
-// (IRP_NOCACHE path), where the OS readahead does not apply.
-// =============================================================================
-
-#define PREFETCH_MAX_ENTRIES 4
-#define PREFETCH_MAX_FCBS    32
-
-typedef struct {
-    uint64_t file_offset;   // File offset this entry covers
-    uint32_t file_size;     // Valid file data size
-    uint32_t disk_size;     // Aligned disk read size
-    uint32_t bumpoff;       // Alignment offset within disk buffer
-    uint8_t* data;          // Raw disk buffer (NonPagedPool)
-} prefetch_entry;
-
-typedef struct {
-    fcb*    fcb_ptr;        // Associated fcb (NULL = slot unused)
-    uint64_t last_read_end; // End offset of last successful read
-    uint32_t seq_count;     // Consecutive sequential reads counter
-    prefetch_entry entries[PREFETCH_MAX_ENTRIES];
-    uint32_t count;         // Number of valid entries
-} prefetch_state;
-
-static prefetch_state g_prefetch_cache[PREFETCH_MAX_FCBS];
-static FAST_MUTEX g_prefetch_mutex;
-static bool g_prefetch_inited = false;
 
 extern bool diskacc;
 extern tPsUpdateDiskCounters fPsUpdateDiskCounters;
@@ -2793,215 +2764,6 @@ NTSTATUS read_stream(fcb* fcb, uint8_t* data, uint64_t start, ULONG length, ULON
     return STATUS_SUCCESS;
 }
 
-// --- Prefetch cache helper functions ---
-
-static void prefetch_cache_init(void) {
-    if (!g_prefetch_inited) {
-        ExInitializeFastMutex(&g_prefetch_mutex);
-        RtlZeroMemory(g_prefetch_cache, sizeof(g_prefetch_cache));
-        g_prefetch_inited = true;
-    }
-}
-
-static prefetch_state* prefetch_cache_find(fcb* fcb) {
-    prefetch_state* oldest = NULL;
-    uint32_t oldest_seq = UINT32_MAX;
-
-    for (int i = 0; i < PREFETCH_MAX_FCBS; i++) {
-        if (g_prefetch_cache[i].fcb_ptr == fcb)
-            return &g_prefetch_cache[i];
-        if (g_prefetch_cache[i].fcb_ptr == NULL) {
-            g_prefetch_cache[i].fcb_ptr = fcb;
-            return &g_prefetch_cache[i];
-        }
-        if (g_prefetch_cache[i].seq_count < oldest_seq) {
-            oldest_seq = g_prefetch_cache[i].seq_count;
-            oldest = &g_prefetch_cache[i];
-        }
-    }
-
-    // All slots full — evict the one with the lowest sequential count
-    if (oldest) {
-        for (int j = 0; j < PREFETCH_MAX_ENTRIES; j++) {
-            if (oldest->entries[j].data) {
-                ExFreePool(oldest->entries[j].data);
-                oldest->entries[j].data = NULL;
-            }
-        }
-        oldest->fcb_ptr = fcb;
-        oldest->last_read_end = 0;
-        oldest->seq_count = 0;
-        oldest->count = 0;
-    }
-    return oldest;
-}
-
-static void prefetch_cache_clear(prefetch_state* state) {
-    for (uint32_t i = 0; i < PREFETCH_MAX_ENTRIES; i++) {
-        if (state->entries[i].data) {
-            ExFreePool(state->entries[i].data);
-            state->entries[i].data = NULL;
-        }
-    }
-    state->count = 0;
-}
-
-// Try to serve [start, start+len) from the prefetch cache.
-// Returns the number of bytes served (may be < len on partial/miss).
-static uint32_t prefetch_cache_read(fcb* fcb, uint64_t start, uint32_t len, uint8_t* dest) {
-    prefetch_state* state;
-    uint32_t served = 0;
-
-    ExAcquireFastMutex(&g_prefetch_mutex);
-
-    state = prefetch_cache_find(fcb);
-    if (!state || state->count == 0) {
-        ExReleaseFastMutex(&g_prefetch_mutex);
-        return 0;
-    }
-
-    // Walk cache entries and copy overlapping regions
-    uint64_t range_end = start + (uint64_t)len;
-
-    for (uint32_t i = 0; i < state->count && served < len; i++) {
-        prefetch_entry* e = &state->entries[i];
-        if (!e->data) continue;
-
-        uint64_t e_start = e->file_offset;
-        uint64_t e_end   = e_start + e->file_size;
-
-        if (start < e_end && range_end > e_start) {
-            uint64_t copy_start = max(start, e_start);
-            uint64_t copy_end   = min(range_end, e_end);
-            uint32_t dest_off   = (uint32_t)(copy_start - start);
-            uint32_t src_off    = (uint32_t)(copy_start - e_start) + e->bumpoff;
-            uint32_t copy_size  = (uint32_t)(copy_end - copy_start);
-
-            RtlCopyMemory(dest + dest_off, e->data + src_off, copy_size);
-            served += copy_size;
-        }
-    }
-
-    ExReleaseFastMutex(&g_prefetch_mutex);
-    return served;
-}
-
-// Prefetch upcoming extents after a successful sequential read.
-// Called at the end of read_file() on the success path.
-static void prefetch_upcoming_extents(fcb* fcb, uint64_t read_end) {
-    prefetch_state* state;
-    LIST_ENTRY* le;
-    uint32_t count = 0;
-
-    ExAcquireFastMutex(&g_prefetch_mutex);
-
-    state = prefetch_cache_find(fcb);
-    if (!state) {
-        ExReleaseFastMutex(&g_prefetch_mutex);
-        return;
-    }
-
-    // Detect sequential access: read_end should be >= last_read_end and within 1 MB
-    if (state->last_read_end > 0 &&
-        read_end >= state->last_read_end &&
-        read_end - state->last_read_end <= 1024 * 1024) {
-        state->seq_count++;
-    } else {
-        state->seq_count = 1;
-        prefetch_cache_clear(state);
-    }
-    state->last_read_end = read_end;
-
-    // Only prefetch after we've confirmed sequential pattern (2+ reads)
-    if (state->seq_count < 2) {
-        ExReleaseFastMutex(&g_prefetch_mutex);
-        return;
-    }
-
-    // Find the extent that covers or follows read_end
-    le = fcb->extents.Flink;
-    while (le != &fcb->extents) {
-        extent* ext = CONTAINING_RECORD(le, extent, list_entry);
-
-        if (!ext->ignore) {
-            struct btrfs_file_extent_item* ed = &ext->extent_data;
-            uint64_t len;
-
-            if (ed->type == BTRFS_FILE_EXTENT_REG || ed->type == BTRFS_FILE_EXTENT_PREALLOC)
-                len = ed->num_bytes;
-            else
-                len = ed->ram_bytes;
-
-            if (ext->offset + len > read_end)
-                break;
-        }
-
-        le = le->Flink;
-    }
-
-    // Clear stale prefetch entries
-    prefetch_cache_clear(state);
-
-    // Prefetch up to PREFETCH_MAX_ENTRIES upcoming REGULAR non-compressed extents
-    while (le != &fcb->extents && count < PREFETCH_MAX_ENTRIES) {
-        extent* ext = CONTAINING_RECORD(le, extent, list_entry);
-
-        if (!ext->ignore && ext->extent_data.type == BTRFS_FILE_EXTENT_REG) {
-            struct btrfs_file_extent_item* ed = &ext->extent_data;
-
-            if (ed->compression == BTRFS_COMPRESS_NONE) {
-                chunk* c;
-                uint64_t addr;
-                uint32_t file_size, to_read, bumpoff = 0;
-                uint8_t* buf;
-                NTSTATUS Status;
-
-                file_size = (uint32_t)ed->num_bytes;
-                if (file_size == 0) goto next_prefetch;
-
-                addr = ed->disk_bytenr + ed->offset;
-                to_read = (uint32_t)sector_align(file_size, fcb->Vcb->superblock.sectorsize);
-
-                if (addr & (fcb->Vcb->superblock.sectorsize - 1)) {
-                    bumpoff = (uint32_t)(addr & (fcb->Vcb->superblock.sectorsize - 1));
-                    addr -= bumpoff;
-                    to_read = (uint32_t)sector_align(file_size + bumpoff,
-                                                      fcb->Vcb->superblock.sectorsize);
-                }
-
-                buf = ExAllocatePoolWithTag(NonPagedPool, to_read, ALLOC_TAG);
-                if (!buf) goto next_prefetch;
-
-                c = get_chunk_from_address(fcb->Vcb, addr);
-                if (!c) {
-                    ExFreePool(buf);
-                    goto next_prefetch;
-                }
-
-                Status = read_data(fcb->Vcb, addr, to_read, NULL, false, buf, c, NULL,
-                                   NULL, 0, true, LowPagePriority);
-                if (NT_SUCCESS(Status)) {
-                    state->entries[count].file_offset = ext->offset;
-                    state->entries[count].file_size   = file_size;
-                    state->entries[count].disk_size   = to_read;
-                    state->entries[count].bumpoff     = bumpoff;
-                    state->entries[count].data        = buf;
-                    count++;
-                } else {
-                    ExFreePool(buf);
-                }
-            }
-        }
-
-    next_prefetch:
-        le = le->Flink;
-    }
-
-    state->count = count;
-
-    ExReleaseFastMutex(&g_prefetch_mutex);
-}
-
 __attribute__((nonnull(1, 2)))
 NTSTATUS read_file(fcb* fcb, uint8_t* data, uint64_t start, uint64_t length, ULONG* pbr, PIRP Irp) {
     NTSTATUS Status;
@@ -3023,20 +2785,6 @@ NTSTATUS read_file(fcb* fcb, uint8_t* data, uint64_t start, uint64_t length, ULO
 
     InitializeListHead(&read_parts);
     InitializeListHead(&calc_jobs);
-
-    // --- Prefetch cache fast path ---
-    // If the requested range is fully covered by prefetched data, serve it
-    // directly and skip the normal extent iteration + read_data path.
-    prefetch_cache_init();
-    {
-        uint32_t cached = prefetch_cache_read(fcb, start, (uint32_t)length, data);
-        if (cached >= (uint32_t)length) {
-            bytes_read = (uint32_t)length;
-            Status = STATUS_SUCCESS;
-            if (pbr) *pbr = bytes_read;
-            goto exit;
-        }
-    }
 
     pool_type = fcb->Header.Flags2 & FSRTL_FLAG2_IS_PAGING_FILE ? NonPagedPool : PagedPool;
 
@@ -3548,10 +3296,6 @@ nextitem:
         ExFreeToNPagedLookasideList(&fcb->Vcb->comp_calc_job_lookaside, ccj);
     }
 
-    // --- Prefetch upcoming extents for sequential access ---
-    if (NT_SUCCESS(Status) && bytes_read > 0)
-        prefetch_upcoming_extents(fcb, start + bytes_read);
-
     if (pbr)
         *pbr = bytes_read;
 
@@ -3775,7 +3519,7 @@ NTSTATUS __stdcall drv_read(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     bool top_level;
     fcb* fcb;
     ccb* ccb;
-    bool acquired_fcb_lock = false, acquired_subvol_lock = false, wait;
+    bool acquired_fcb_lock = false, wait;
 
     FsRtlEnterFileSystem();
 
@@ -3844,30 +3588,21 @@ NTSTATUS __stdcall drv_read(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     if (Irp->Flags & IRP_PAGING_IO)
         wait = true;
 
-    // REMOVED: CcFlushCache before read was unnecessary and hurt mixed read/write performance.
-    // The Windows Cache Manager handles coherency correctly without this synchronous flush.
+    if (!(Irp->Flags & IRP_PAGING_IO) && FileObject->SectionObjectPointer && FileObject->SectionObjectPointer->DataSectionObject) {
+        IO_STATUS_BLOCK iosb;
 
-    // Acquire subvol_lock shared to allow parallel reads across different subvolumes.
-    // Lock hierarchy: subvol_lock -> fcb->Header.Resource (tree_lock is NOT held here).
-    // Only acquire if fcb has a valid subvol (volume_fcb case already handled above).
-    if (fcb->subvol) {
-        if (!ExAcquireResourceSharedLite(&fcb->subvol->subvol_lock, wait)) {
-            Status = STATUS_PENDING;
-            IoMarkIrpPending(Irp);
+        CcFlushCache(FileObject->SectionObjectPointer, &IrpSp->Parameters.Read.ByteOffset, IrpSp->Parameters.Read.Length, &iosb);
+        if (!NT_SUCCESS(iosb.Status)) {
+            ERR("CcFlushCache returned %08lx\n", iosb.Status);
+            Status = iosb.Status;
             goto exit;
         }
-
-        acquired_subvol_lock = true;
     }
 
     if (!ExIsResourceAcquiredSharedLite(fcb->Header.Resource)) {
         if (!ExAcquireResourceSharedLite(fcb->Header.Resource, wait)) {
             Status = STATUS_PENDING;
             IoMarkIrpPending(Irp);
-
-            if (acquired_subvol_lock)
-                ExReleaseResourceLite(&fcb->subvol->subvol_lock);
-
             goto exit;
         }
 
@@ -3878,9 +3613,6 @@ NTSTATUS __stdcall drv_read(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
     if (acquired_fcb_lock)
         ExReleaseResourceLite(fcb->Header.Resource);
-
-    if (acquired_subvol_lock)
-        ExReleaseResourceLite(&fcb->subvol->subvol_lock);
 
 exit:
     if (FileObject->Flags & FO_SYNCHRONOUS_IO && !(Irp->Flags & IRP_PAGING_IO))

@@ -22,7 +22,7 @@
 
 // Invalidate (free) the binary search index for a tree node.
 // After this, searches fall back to linear traversal of itemlist.
-static __inline void invalidate_search_index(tree* t) {
+void invalidate_search_index(tree* t) {
     if (t->search_index) {
         ExFreePool(t->search_index);
         t->search_index = NULL;

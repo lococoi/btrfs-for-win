@@ -89,47 +89,20 @@ bool find_data_address_in_chunk(device_extension* Vcb, chunk* c, uint64_t length
 
 __attribute__((nonnull(1)))
 chunk* get_chunk_from_address(device_extension* Vcb, uint64_t address) {
-    uint32_t h = get_chunk_hash(address);
+    LIST_ENTRY* le2;
 
     ExAcquireResourceSharedLite(&Vcb->chunk_lock, true);
 
-    // Search the target bucket first (O(1) fast path)
-    {
-        LIST_ENTRY* le = Vcb->chunks_hash_table[h].Flink;
+    le2 = Vcb->chunks.Flink;
+    while (le2 != &Vcb->chunks) {
+        chunk* c = CONTAINING_RECORD(le2, chunk, list_entry);
 
-        while (le != &Vcb->chunks_hash_table[h]) {
-            chunk* c = CONTAINING_RECORD(le, chunk, list_entry_hash);
-
-            if (address >= c->offset && address < c->offset + c->chunk_item->length) {
-                ExReleaseResourceLite(&Vcb->chunk_lock);
-                return c;
-            }
-
-            le = le->Flink;
+        if (address >= c->offset && address < c->offset + c->chunk_item->length) {
+            ExReleaseResourceLite(&Vcb->chunk_lock);
+            return c;
         }
-    }
 
-    // The chunk's offset may hash to a different bucket than the address.
-    // Search backward through previous buckets to find it.
-    for (uint32_t i = 1; i < CHUNK_HASH_TABLE_SIZE; i++) {
-        uint32_t bucket = (h + CHUNK_HASH_TABLE_SIZE - i) % CHUNK_HASH_TABLE_SIZE;
-        LIST_ENTRY* le = Vcb->chunks_hash_table[bucket].Flink;
-
-        while (le != &Vcb->chunks_hash_table[bucket]) {
-            chunk* c = CONTAINING_RECORD(le, chunk, list_entry_hash);
-
-            if (address >= c->offset && address < c->offset + c->chunk_item->length) {
-                ExReleaseResourceLite(&Vcb->chunk_lock);
-                return c;
-            }
-
-            // If this chunk ends before or at the address, it's too small — keep scanning.
-            // If this chunk starts after the address, no chunk in this bucket can contain it.
-            if (c->offset > address)
-                break;
-
-            le = le->Flink;
-        }
+        le2 = le2->Flink;
     }
 
     ExReleaseResourceLite(&Vcb->chunk_lock);
@@ -730,8 +703,6 @@ end:
 
         if (!done)
             InsertTailList(&Vcb->chunks, &c->list_entry);
-
-        chunk_hash_insert(Vcb, c);
 
         c->created = true;
         c->changed = true;
@@ -5095,17 +5066,6 @@ NTSTATUS __stdcall drv_write(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp) {
         Status = STATUS_MEDIA_WRITE_PROTECTED;
         goto end;
     }
-
-    // NOTA: subvol_lock NO se integra aquí (a nivel drv_write) porque write_file2()
-    // adquiere tree_lock shared internamente. Agregar subvol_lock aquí crearía un
-    // orden: subvol_lock -> tree_lock, lo cual viola la jerarquía establecía
-    // tree_lock -> subvol_lock y causaría deadlock con el flush thread
-    // (que toma tree_lock exclusive).
-    //
-    // Para integrar subvol_lock en escritura, debería hacerse dentro de write_file2()
-    // DESPUÉS de que tree_lock se haya adquirido, reemplazando tree_lock shared
-    // por subvol_lock exclusive en paths que solo tocan un subvolumen.
-    // Esto requiere un análisis más profundo de write_file2() y sus callers.
 
     try {
         if (IrpSp->MinorFunction & IRP_MN_COMPLETE) {

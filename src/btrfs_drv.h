@@ -436,11 +436,6 @@ typedef struct {
     ERESOURCE load_tree_lock;
 } root_nonpaged;
 
-// Lock level for per-subvolume locks. Hierarchy: tree_lock -> subvol_lock.
-// subvol_lock protects subvolume-specific state (fcbs list, subvol flags, etc.)
-// and is acquired AFTER tree_lock when both are needed.
-_Create_lock_level_(subvol_lock)
-
 typedef struct _root {
     uint64_t id;
     LONGLONG lastinode; // signed so we can use InterlockedIncrement64
@@ -455,19 +450,6 @@ typedef struct _root {
     uint64_t fcbs_version;
     bool checked_for_orphans;
     bool dropped;
-    // Per-subvolume lock. Protects subvolume-specific state (fcbs list,
-    // subvol dirty flag, subvol metadata). Hierarchy: tree_lock -> subvol_lock.
-    //
-    // DESIGN NOTE (Phase 3.1 - Granular tree_lock analysis):
-    // This lock is NOT used in the flush path because flush_fcb() modifies
-    // global state (checksum tree via add_checksum_entry(), extent tree via
-    // rationalize_extents()), commit_batch_list() modifies the global tree
-    // cache, and update_chunks()/write_trees() are cross-subvolume ops.
-    //
-    // USE CASE: Intended for I/O path operations that only access a single
-    // subvolume's data (e.g., read_csum(), single-file reads), where it can
-    // replace tree_lock shared to allow true parallelism across subvolumes.
-    _Has_lock_level_(subvol_lock) ERESOURCE subvol_lock;
     LIST_ENTRY fcbs;
     LIST_ENTRY* fcbs_ptrs[256];
     LIST_ENTRY list_entry;
@@ -598,7 +580,6 @@ typedef struct {
 
     LIST_ENTRY list_entry;
     LIST_ENTRY list_entry_balance;
-    LIST_ENTRY list_entry_hash;
 } chunk;
 
 typedef struct {
@@ -855,9 +836,6 @@ typedef struct _device_extension {
     LIST_ENTRY sys_chunks;
     LIST_ENTRY chunks;
 
-#define CHUNK_HASH_TABLE_SIZE 256
-    LIST_ENTRY chunks_hash_table[CHUNK_HASH_TABLE_SIZE];
-
     LIST_ENTRY trees;
     LIST_ENTRY trees_hash;
     LIST_ENTRY* trees_ptrs[256];
@@ -893,19 +871,6 @@ typedef struct _device_extension {
     NPAGED_LOOKASIDE_LIST write_data_stripe_lookaside;
     LIST_ENTRY list_entry;
 } device_extension;
-
-static inline uint32_t get_chunk_hash(uint64_t offset) {
-    return (uint32_t)((offset >> 16) % CHUNK_HASH_TABLE_SIZE);
-}
-
-static inline void chunk_hash_insert(device_extension* Vcb, chunk* c) {
-    uint32_t h = get_chunk_hash(c->offset);
-    InsertTailList(&Vcb->chunks_hash_table[h], &c->list_entry_hash);
-}
-
-static inline void chunk_hash_remove(chunk* c) {
-    RemoveEntryList(&c->list_entry_hash);
-}
 
 typedef struct {
     uint32_t type;
@@ -1341,6 +1306,7 @@ NTSTATUS insert_tree_item(_In_ _Requires_exclusive_lock_held_(_Curr_->tree_lock)
 NTSTATUS delete_tree_item(_In_ _Requires_exclusive_lock_held_(_Curr_->tree_lock) device_extension* Vcb,
                           _Inout_ traverse_ptr* tp) __attribute__((nonnull(1,2)));
 void free_tree(tree* t) __attribute__((nonnull(1)));
+void invalidate_search_index(tree* t) __attribute__((nonnull(1)));
 NTSTATUS load_tree(device_extension* Vcb, uint64_t addr, uint8_t* buf, root* r, tree** pt) __attribute__((nonnull(1,3,4,5)));
 NTSTATUS do_load_tree(device_extension* Vcb, tree_holder* th, root* r, tree* t, tree_data* td, PIRP Irp) __attribute__((nonnull(1,2,3)));
 void clear_rollback(LIST_ENTRY* rollback) __attribute__((nonnull(1)));

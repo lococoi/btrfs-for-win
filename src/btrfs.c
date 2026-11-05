@@ -1322,7 +1322,6 @@ NTSTATUS create_root(_In_ _Requires_exclusive_lock_held_(_Curr_->tree_lock) devi
     }
 
     ExInitializeResourceLite(&r->nonpaged->load_tree_lock);
-    ExInitializeResourceLite(&r->subvol_lock);
 
     InsertTailList(&Vcb->roots, &r->list_entry);
 
@@ -1761,7 +1760,6 @@ void reap_fcb(fcb* fcb) {
         RemoveEntryList(&fcb->list_entry);
 
         if (fcb->subvol && fcb->subvol->dropped && IsListEmpty(&fcb->subvol->fcbs)) {
-            ExDeleteResourceLite(&fcb->subvol->subvol_lock);
             ExDeleteResourceLite(&fcb->subvol->nonpaged->load_tree_lock);
             ExFreePool(fcb->subvol->nonpaged);
             ExFreePool(fcb->subvol);
@@ -2139,7 +2137,6 @@ void uninit(_In_ device_extension* Vcb) {
     while (!IsListEmpty(&Vcb->roots)) {
         root* r = CONTAINING_RECORD(RemoveHeadList(&Vcb->roots), root, list_entry);
 
-        ExDeleteResourceLite(&r->subvol_lock);
         ExDeleteResourceLite(&r->nonpaged->load_tree_lock);
         ExFreePool(r->nonpaged);
         ExFreePool(r);
@@ -3045,7 +3042,6 @@ static NTSTATUS add_root(_Inout_ device_extension* Vcb, _In_ uint64_t id, _In_ u
     }
 
     ExInitializeResourceLite(&r->nonpaged->load_tree_lock);
-    ExInitializeResourceLite(&r->subvol_lock);
 
     r->lastinode = 0;
 
@@ -3738,8 +3734,6 @@ static NTSTATUS load_chunk_root(_In_ _Requires_lock_held_(_Curr_->tree_lock) dev
                 c->last_stripe = 0;
 
                 InsertTailList(&Vcb->chunks, &c->list_entry);
-
-                chunk_hash_insert(Vcb, c);
 
                 c->list_entry_balance.Flink = NULL;
             }
@@ -4751,8 +4745,6 @@ static NTSTATUS mount_vol(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp) {
     }
 
     InitializeListHead(&Vcb->chunks);
-    for (uint32_t i = 0; i < CHUNK_HASH_TABLE_SIZE; i++)
-        InitializeListHead(&Vcb->chunks_hash_table[i]);
     InitializeListHead(&Vcb->trees);
     InitializeListHead(&Vcb->trees_hash);
     InitializeListHead(&Vcb->all_fcbs);

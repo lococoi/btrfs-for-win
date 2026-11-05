@@ -31,11 +31,6 @@
 
 #define BATCH_ITEM_LIMIT 1000
 
-// Minimum number of tree nodes to justify creating parallel worker threads
-// for checksum computation. Below this threshold, checksums are computed
-// sequentially on the calling thread.
-#define TREE_CSUM_PARALLEL_THRESHOLD 8
-
 typedef struct {
     KEVENT Event;
     IO_STATUS_BLOCK iosb;
@@ -1814,7 +1809,9 @@ static NTSTATUS launch_tree_writes(device_extension* Vcb, LIST_ENTRY* tree_write
         if (!NT_SUCCESS(Status)) {
             ERR("write_data returned %08lx\n", Status);
 
-            for (i = 0; i < num_bits; i++) {
+            // Only the first bit_num entries were initialised (and had their Vcb set
+            // by write_data), so only those may be freed.
+            for (i = 0; i < bit_num; i++) {
                 free_write_data_stripes(&wtc[i]);
             }
             ExFreePool(wtc);
@@ -1959,155 +1956,14 @@ void calc_tree_checksum(device_extension* Vcb, struct btrfs_header* th) {
     }
 }
 
-// --- Parallel tree checksum infrastructure ---
-//
-// The existing calc thread system (calcthread.c) is designed for sector-level
-// checksums where each job processes sector_size bytes via calc_thread_crc32c
-// etc. Tree checksums are fundamentally different: each B-tree node is
-// node_size bytes (typically 16 KB) and the checksum covers
-// node_size - sizeof(csum) bytes, written in-place at offset 0 of the node.
-//
-// The calc_thread_crc32c handler hardcodes Vcb->superblock.sectorsize for both
-// the pointer advance and the CRC length, making it incompatible with tree node
-// checksums. Adding a new calc_thread_type would require modifying btrfs_drv.h
-// and calcthread.c, which is outside the scope of this change.
-//
-// Instead, we use temporary system threads with an atomic work-distribution
-// counter. Each thread pulls the next unprocessed node via InterlockedIncrement
-// and calls calc_tree_checksum(). The calling (flush) thread also participates
-// as a worker to avoid idling.
-
-typedef struct {
-    device_extension* Vcb;
-    struct btrfs_header** nodes;
-    uint32_t count;
-    volatile LONG next_index;
-    KEVENT done_event;
-    volatile LONG workers_left;
-} tree_csum_batch;
-
-_Function_class_(KSTART_ROUTINE)
-static void __stdcall tree_csum_worker(void* context) {
-    tree_csum_batch* batch = (tree_csum_batch*)context;
-
-    while (true) {
-        LONG idx = InterlockedIncrement(&batch->next_index) - 1;
-        if (idx >= (LONG)batch->count)
-            break;
-
-        calc_tree_checksum(batch->Vcb, batch->nodes[idx]);
-    }
-
-    if (InterlockedDecrement(&batch->workers_left) == 0)
-        KeSetEvent(&batch->done_event, 0, false);
-}
-
-static void dispatch_tree_checksums_batch(device_extension* Vcb, LIST_ENTRY* tree_writes) {
-    uint32_t count = 0;
-    uint32_t i, num_workers;
+// Tree checksums are computed after all nodes have been built, once we know
+// which of them are actually going to be written (see dispatch_tree_checksums()).
+static void dispatch_tree_checksums(device_extension* Vcb, LIST_ENTRY* tree_writes) {
     LIST_ENTRY* le;
-    struct btrfs_header** nodes;
-    HANDLE* thread_handles;
-    tree_csum_batch batch;
 
-    // Count tree write entries
-    for (le = tree_writes->Flink; le != tree_writes; le = le->Flink)
-        count++;
-
-    if (count == 0)
-        return;
-
-    // Sequential path for small batches — thread creation overhead would
-    // outweigh the parallelism benefit.
-    if (count < TREE_CSUM_PARALLEL_THRESHOLD) {
-        for (le = tree_writes->Flink; le != tree_writes; le = le->Flink) {
-            tree_write* tw = CONTAINING_RECORD(le, tree_write, list_entry);
-            calc_tree_checksum(Vcb, (struct btrfs_header*)tw->data);
-        }
-        return;
-    }
-
-    // Allocate array of node pointers for workers to index into
-    nodes = ExAllocatePoolWithTag(NonPagedPool, count * sizeof(struct btrfs_header*), ALLOC_TAG);
-    if (!nodes) {
-        ERR("out of memory for tree csum batch, falling back to sequential\n");
-        goto fallback_sequential;
-    }
-
-    i = 0;
     for (le = tree_writes->Flink; le != tree_writes; le = le->Flink) {
         tree_write* tw = CONTAINING_RECORD(le, tree_write, list_entry);
-        nodes[i++] = (struct btrfs_header*)tw->data;
-    }
 
-    // Determine worker count based on existing calc thread pool.
-    // Clamp to [2, min(count, 16)] to avoid excessive thread creation.
-    num_workers = Vcb->calcthreads.num_threads;
-    if (num_workers < 2)
-        num_workers = 2;
-    if (num_workers > count)
-        num_workers = count;
-    if (num_workers > 16)
-        num_workers = 16;
-
-    thread_handles = ExAllocatePoolWithTag(NonPagedPool, num_workers * sizeof(HANDLE), ALLOC_TAG);
-    if (!thread_handles) {
-        ERR("out of memory for tree csum thread handles, falling back to sequential\n");
-        ExFreePool(nodes);
-        goto fallback_sequential;
-    }
-
-    // Initialize batch context
-    batch.Vcb = Vcb;
-    batch.nodes = nodes;
-    batch.count = count;
-    batch.next_index = 0;
-    batch.workers_left = num_workers + 1; // +1 for the calling thread
-    KeInitializeEvent(&batch.done_event, NotificationEvent, false);
-
-    // Create worker system threads
-    for (i = 0; i < num_workers; i++) {
-        NTSTATUS Status = PsCreateSystemThread(&thread_handles[i], THREAD_ALL_ACCESS,
-                                                NULL, NULL, NULL,
-                                                (PKSTART_ROUTINE)tree_csum_worker, &batch);
-        if (!NT_SUCCESS(Status)) {
-            ERR("PsCreateSystemThread failed for tree csum worker: %08lx\n", Status);
-            thread_handles[i] = NULL;
-            // This worker slot is lost; account for it
-            if (InterlockedDecrement(&batch.workers_left) == 0)
-                KeSetEvent(&batch.done_event, 0, false);
-        }
-    }
-
-    // The calling (flush) thread also participates as a worker
-    while (true) {
-        LONG idx = InterlockedIncrement(&batch.next_index) - 1;
-        if (idx >= (LONG)batch.count)
-            break;
-
-        calc_tree_checksum(Vcb, batch.nodes[idx]);
-    }
-
-    // Signal calling thread's contribution is done
-    if (InterlockedDecrement(&batch.workers_left) == 0)
-        KeSetEvent(&batch.done_event, 0, false);
-
-    // Wait for all workers to complete
-    KeWaitForSingleObject(&batch.done_event, Executive, KernelMode, false, NULL);
-
-    // Clean up thread handles
-    for (i = 0; i < num_workers; i++) {
-        if (thread_handles[i])
-            ZwClose(thread_handles[i]);
-    }
-
-    ExFreePool(thread_handles);
-    ExFreePool(nodes);
-    return;
-
-fallback_sequential:
-    for (le = tree_writes->Flink; le != tree_writes; le = le->Flink) {
-        tree_write* tw = CONTAINING_RECORD(le, tree_write, list_entry);
         calc_tree_checksum(Vcb, (struct btrfs_header*)tw->data);
     }
 }
@@ -2353,7 +2209,7 @@ static NTSTATUS write_trees(device_extension* Vcb, PIRP Irp, pending_tree_writes
             }
 
             // Checksum is deferred — computed in parallel after all nodes are built.
-            // See dispatch_tree_checksums_batch() below.
+            // See dispatch_tree_checksums() below.
 
             tw = ExAllocatePoolWithTag(PagedPool, sizeof(tree_write), ALLOC_TAG);
             if (!tw) {
@@ -2394,10 +2250,7 @@ static NTSTATUS write_trees(device_extension* Vcb, PIRP Irp, pending_tree_writes
         le = le->Flink;
     }
 
-    // Compute all tree node checksums in parallel before writing to disk.
-    // Each node's checksum is independent (no cross-node dependencies),
-    // so this is safe to parallelize freely.
-    dispatch_tree_checksums_batch(Vcb, tree_writes);
+    dispatch_tree_checksums(Vcb, tree_writes);
 
     if (pending) {
         // Async mode: launch tree writes without waiting.
@@ -3432,6 +3285,9 @@ static NTSTATUS split_tree_at(device_extension* Vcb, tree* t, tree_data* newfirs
     t->header.nritems = numitems;
     nt->write = true;
 
+    // t just lost half its items to nt: any cached search index is stale.
+    invalidate_search_index(t);
+
     InsertTailList(&Vcb->trees, &nt->list_entry);
 
     if (nt->header.level > 0) {
@@ -3868,6 +3724,9 @@ static NTSTATUS try_tree_amalgamate(device_extension* Vcb, tree* t, bool* done,
 
         next_tree->header.nritems = 0;
         next_tree->size = 0;
+
+        invalidate_search_index(t);
+        invalidate_search_index(next_tree);
 
         if (next_tree->has_new_address) { // delete associated EXTENT_ITEM
             Status = reduce_tree_extent(Vcb, next_tree->new_address, next_tree,
@@ -6316,7 +6175,6 @@ static NTSTATUS drop_chunk(device_extension* Vcb, chunk* c, LIST_ENTRY* batchlis
     if (c->chunk_item->type & BTRFS_BLOCK_GROUP_SYSTEM)
         remove_from_bootstrap(Vcb, 0x100, BTRFS_CHUNK_ITEM_KEY, c->offset);
 
-    chunk_hash_remove(c);
     RemoveEntryList(&c->list_entry);
 
     // clear raid56 incompat flag if dropping last RAID5/6 chunk
@@ -8023,18 +7881,13 @@ static NTSTATUS check_for_orphans(device_extension* Vcb, PIRP Irp) {
     return STATUS_SUCCESS;
 }
 
-// do_write2: Función principal de escritura del flush thread.
+// do_write2: main flush-thread write path.
 //
-// LOCKING: Esta función DEBE ser llamada con Vcb->tree_lock adquirido
-// exclusivamente. tree_lock se requiere porque:
-// - Se modifican dirty_fcbs, dirty_filerefs, dirty_subvols (listas globales)
-// - flush_fcb() modifica checksum tree y extent tree (recursos globales)
-// - commit_batch_list() modifica el tree cache global (Vcb->trees)
-// - update_chunks() y write_trees() son operaciones cross-subvolume
-//
-// NOTA FASE 3.1: subvol_lock NO se usa aquí porque todas las operaciones
-// necesitan acceso al estado global del Vcb. subvol_lock está reservado
-// para el I/O path donde las operaciones solo tocan un subvol a la vez.
+// LOCKING: must be called with Vcb->tree_lock held exclusively. tree_lock is
+// needed because dirty_fcbs/dirty_filerefs/dirty_subvols are global lists,
+// flush_fcb() touches the checksum and extent trees, commit_batch_list()
+// mutates the global tree cache, and update_chunks()/write_trees() work
+// across subvolumes.
 // When pending_tcw and pending_sb are non-NULL, do_write2 operates in async mode:
 // it launches tree writes and superblock writes without waiting, stores the I/O
 // state in the output parameters, and returns. The caller must later:
@@ -8191,9 +8044,6 @@ static NTSTATUS do_write2(device_extension* Vcb, PIRP Irp,
 #endif
 
     // No need to get dirty_subvols_lock here, as we have tree_lock exclusively.
-    // FASE 3.1: subvol_lock del subvol no se usa aquí porque flush_subvol()
-    // modifica estado cross-subvol (tree cache global). subvol_lock se usará
-    // en el I/O path para proteger solo operaciones de un solo subvol.
     while (!IsListEmpty(&Vcb->dirty_subvols)) {
         root* r = CONTAINING_RECORD(RemoveHeadList(&Vcb->dirty_subvols), root, list_entry_dirty);
 
@@ -8552,76 +8402,14 @@ NTSTATUS do_write(device_extension* Vcb, PIRP Irp) {
 }
 
 // =============================================================================
-// Phase 3.1 - Granular tree_lock por subvolumen: Análisis y Diseño
-// =============================================================================
+// Async flush: do_write2() only launches the tree and superblock writes; the
+// waits happen in do_flush() once tree_lock has been released, so reads can
+// proceed while the disk I/O is in flight. The post-write cleanup
+// (do_write2_end_cleanup) runs after that, again under tree_lock.
 //
-// ANÁLISIS DEL PROBLEMA:
-// do_flush() adquiere tree_lock exclusivo para TODO el flush thread, bloqueando
-// TODAS las operaciones de I/O del filesystem. El objetivo es permitir paralelismo
-// entre subvolúmenes.
-//
-// POR QUÉ EL LOCK EXCLUSIVO GLOBAL ES NECESARIO EN EL FLUSH PATH:
-//
-// 1. flush_fcb() modifica estado global:
-//    - add_checksum_entry() modifica el checksum root (global, compartido)
-//    - rationalize_extents() puede reasignar extentos (global)
-//    - insert_tree_item_batch() acumula cambios en el tree cache global
-//
-// 2. commit_batch_list() modifica el tree cache global (Vcb->trees):
-//    - Procesa batch items de TODOS los subvolúmenes
-//    - Modifica la estructura de árboles en memoria
-//
-// 3. update_chunks() es inherentemente cross-subvolume:
-//    - Modifica asignación de chunks compartidos entre subvolúmenes
-//    - Rebalance de espacio en disco
-//
-// 4. write_trees() itera TODOS los dirty trees (Vcb->trees):
-//    - Necesita coordinación global para escribir árboles modificados
-//
-// 5. write_superblocks() actualiza el superblock global:
-//    - Generación, parches de superbloque, etc.
-//
-// POR QUÉ NO SE PUEDE USAR subvol_lock EN EL FLUSH PATH:
-//
-// Aunque se itera sobre dirty_fcbs (que contiene fcbs de múltiples subvolúmenes),
-// cada flush_fcb() puede:
-// - Modificar el checksum root (global, no por subvol)
-// - Asignar extentos en el extent root (global)
-// - Agregar items al batchlist que serán procesados por commit_batch_list()
-//   (modifica el tree cache global)
-//
-// La jerarquía de locks establecida es: tree_lock -> subvol_lock
-// Nunca se adquiere subvol_lock sin tree_lock en el flush path.
-//
-// ESTRATEGIA IMPLEMENTADA (Fase 3.1):
-//
-// En vez de mantener tree_lock exclusivo durante TODO do_write2(), se divide
-// el flush en fases con tree_lock liberado entre ellas. Esto permite que
-// operaciones de I/O (lecturas) procedan brevemente entre fases del flush.
-//
-// Fase A: Escritura principal (flush de fcbs, subvols, chunks, trees)
-//   -> tree_lock exclusive durante todo do_write2()
-//   -> Permanece exclusivo porque cada paso modifica estado global
-//
-// Fase B: Liberación de trees
-//   -> tree_lock exclusive solo para free_trees()
-//   -> Separa la fase de escritura de la de limpieza
-//
-// RAZÓN POR LA QUE NO SE PUEDE DIVIDIR do_write2 EN FASES MÁS PEQUEÑAS:
-//
-// El loop de consistencia (do { update_chunks; allocate_cache; } while (...))
-// requiere que el estado del tree sea consistente entre iteraciones. Dividir
-// este loop en secciones con tree_lock liberado entre ellas crearía ventanas
-// donde otro thread podría modificar el tree cache, violando la consistencia.
-//
-// FUTURO (Fases 3.2+):
-//
-// subvol_lock se utilizará en el path de I/O (lectura/escritura de archivos):
-// - Operaciones de solo lectura de un subvol adquieren subvol_lock shared
-// - Permite paralelismo real: lee/subvol_A simultáneo con lee/subvol_B
-// - tree_lock shared se mantiene solo para acceso al tree cache global
-// - tree_lock exclusive se mantiene solo para operaciones de escritura
-//
+// tree_lock cannot be narrowed any further: the consistency loop in
+// do_write2() (update_chunks/allocate_cache until the trees are consistent)
+// needs the tree cache to stay untouched between iterations.
 // =============================================================================
 
 // Post-write cleanup: updates children generations, clears flags,
@@ -8715,10 +8503,6 @@ static void do_flush(device_extension* Vcb) {
     // Phase 3.2: Las escrituras de disco se lanzan pero NO se esperan dentro
     // de tree_lock. Esto permite liberar el lock más temprano y continuar
     // con I/O mientras esperamos.
-    //
-    // FUTURO: Cuando subvol_lock esté integrado en el I/O path, se podría
-    // reducir tree_lock a shared durante las fases 2-5 (flush de fcbs),
-    // manteniendo exclusivo solo para fases 6-10.
 
     ExAcquireResourceExclusiveLite(&Vcb->tree_lock, true);
 
@@ -8778,6 +8562,17 @@ static void do_flush(device_extension* Vcb) {
             }
             free_superblocks_context(sb_ctx);
             sb_ctx = NULL;
+        }
+
+        // Barrier flush after the superblocks, as in the synchronous path: without
+        // this, write_superblocks() may still be sitting in the disk cache when we
+        // report success.
+        if (NT_SUCCESS(Status) && !Vcb->options.no_barrier) {
+            NTSTATUS ws = flush_disk_caches(Vcb);
+            if (!NT_SUCCESS(ws)) {
+                ERR("flush_disk_caches returned %08lx\n", ws);
+                Status = ws;
+            }
         }
     }
 

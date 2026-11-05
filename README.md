@@ -322,22 +322,26 @@ from an elevated command prompt, and reboot.
 Changelog
 ---------
 
-v2.0 (2026-08-07) — Performance-optimised fork:
-* Removed the synchronous CcFlushCache from cached read paths
-* Replaced per-call allocation in checksum verification with a stack buffer
-* Added an O(1) hash table for chunk lookups
-* Parallelised tree checksum computation
-* Switched extent decompression scheduling from LIFO to FIFO
-* Added a binary-search index to B-tree nodes
-* Added a real parallel decompression pipeline
-* Pooled read/compress/write buffers with NPAGED lookaside lists
-* Introduced per-subvolume locking with hierarchical locking in do_flush
-* Added asynchronous flush with launch/wait split for tree writes and superblocks
-* Added sequential extent prefetch (32-slot cache) and sibling-node prefetch
-* Added adaptive, balanced B-tree splitting
+v2.0 (fork) — upstream v1.10 plus:
+* Replaced the per-call allocation in checksum verification with a stack buffer
+* Decompression jobs are dispatched to the calc thread pool and collected FIFO
+* Added a binary-search index to B-tree nodes (invalidated on every mutation)
+* Pooled read/compress/write buffers with lookaside lists
+* Asynchronous flush: tree and superblock writes are launched under tree_lock
+  and waited for once it has been released
+* Adaptive, balanced B-tree splitting
+* Smaller allocation when decompressing a partial inline extent
 * Upgraded bundled zstd and zlib submodules
 * Added GitHub Actions CI (builds on windows-latest with MSVC + WDK)
 * Added LICENSE (LGPL-3.0) and .gitignore
+
+Reviewed before release and dropped from this fork, because they were not
+safe: a per-fcb extent prefetch cache that could serve stale data after a
+write, a chunk hash table that hashed the chunk start rather than the address
+(so it rarely hit and fell back to a full scan), a per-subvolume lock that
+nothing ever took exclusively, and tree checksums computed on freshly created
+kernel threads. The synchronous CcFlushCache in the cached read path is
+still there.
 
 v1.10 (2026-09-01):
 * Added support for writing free-space bitmaps (reading was already supported)

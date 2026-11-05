@@ -33,7 +33,7 @@ static const char root_dir[] = "$Root";
 static const WCHAR root_dir_utf16[] = L"$Root";
 
 #ifndef _MSC_VER
-// Windows 10 - these are provided by WDK when using MSVC
+// Windows 10 - provided by the WDK when building with MSVC
 #define ATOMIC_CREATE_ECP_IN_FLAG_REPARSE_POINT_SPECIFIED   0x0002
 #define ATOMIC_CREATE_ECP_IN_FLAG_OP_FLAGS_SPECIFIED        0x0080
 #define ATOMIC_CREATE_ECP_IN_FLAG_BEST_EFFORT               0x0100
